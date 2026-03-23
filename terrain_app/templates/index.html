@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Terrain viewer — 3DEP + imagery</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0f1218;
+      --panel: #171c26;
+      --border: #2a3142;
+      --text: #e8ecf4;
+      --muted: #8b95a8;
+      --accent: #6ea8fe;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      display: grid;
+      grid-template-columns: 320px 1fr;
+    }
+    aside {
+      border-right: 1px solid var(--border);
+      padding: 1.25rem;
+      background: var(--panel);
+      overflow: auto;
+    }
+    h1 {
+      font-size: 1.05rem;
+      font-weight: 600;
+      margin: 0 0 0.35rem;
+    }
+    p.lead {
+      margin: 0 0 1rem;
+      font-size: 0.8rem;
+      color: var(--muted);
+      line-height: 1.45;
+    }
+    label {
+      display: block;
+      font-size: 0.72rem;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      color: var(--muted);
+      margin: 0.75rem 0 0.35rem;
+    }
+    input[type="file"] {
+      width: 100%;
+      font-size: 0.8rem;
+    }
+    select, input[type="number"] {
+      width: 100%;
+      padding: 0.45rem 0.5rem;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      background: var(--bg);
+      color: var(--text);
+      font-size: 0.85rem;
+    }
+    button {
+      margin-top: 1rem;
+      width: 100%;
+      padding: 0.55rem 0.75rem;
+      border-radius: 8px;
+      border: none;
+      background: var(--accent);
+      color: #0b1020;
+      font-weight: 600;
+      cursor: pointer;
+      font-size: 0.9rem;
+    }
+    button:disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
+    }
+    .exports {
+      margin-top: 1.25rem;
+      padding-top: 1rem;
+      border-top: 1px solid var(--border);
+      font-size: 0.8rem;
+    }
+    .exports a {
+      color: var(--accent);
+      display: block;
+      margin-top: 0.35rem;
+      word-break: break-all;
+    }
+    .status {
+      margin-top: 0.75rem;
+      font-size: 0.78rem;
+      color: var(--muted);
+      white-space: pre-wrap;
+    }
+    #viewport {
+      position: relative;
+      min-height: 100vh;
+    }
+    #viewport canvas {
+      display: block;
+      width: 100%;
+      height: 100vh;
+    }
+    .hint {
+      position: absolute;
+      bottom: 12px;
+      left: 12px;
+      font-size: 0.72rem;
+      color: var(--muted);
+      pointer-events: none;
+    }
+  </style>
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+        "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+      }
+    }
+  </script>
+</head>
+<body>
+  <aside>
+    <h1>Terrain viewer</h1>
+    <p class="lead">KML boundary → USGS 3DEP + overhead imagery (UTM). Use satellite or ortho for trees, water, roofs. Drag to orbit · scroll to zoom.</p>
+    <label for="kml">KML file</label>
+    <input id="kml" type="file" accept=".kml,.xml" />
+    <label for="imagery">Imagery</label>
+    <select id="imagery">
+      <option value="esri" selected>Esri World Imagery (satellite)</option>
+      <option value="oam">OpenAerialMap (GeoTIFF warp or TMS)</option>
+      <option value="osm">OpenStreetMap (carto, not aerial)</option>
+    </select>
+    <label for="grid">Grid size (max dimension)</label>
+    <input id="grid" type="number" min="64" max="2048" value="384" />
+    <label for="buffer">Buffer (m)</label>
+    <input id="buffer" type="number" min="0" value="80" />
+    <label for="vex">Vertical exaggeration</label>
+    <input id="vex" type="number" min="0.01" step="0.05" value="1" />
+    <button id="run" type="button">Build scene</button>
+    <div class="status" id="status"></div>
+    <div class="exports" id="exports" hidden>
+      <strong>Export</strong>
+      <a id="lnk-glb" href="#" download>terrain.glb</a>
+      <a id="lnk-zip" href="#" download>terrain_obj.zip</a>
+    </div>
+  </aside>
+  <div id="viewport">
+    <div class="hint">Elevation (Y) uses min-subtracted meters × exaggeration · X/Z = UTM easting/northing (m). Satellite: Esri, Maxar, Earthstar, GIS community. OSM © contributors. OAM = dataset license.</div>
+  </div>
+  <script type="module" src="{{ url_for('static', filename='viewer.js') }}"></script>
+</body>
+</html>

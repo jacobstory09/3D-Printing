@@ -1,0 +1,7 @@
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+instance/
+terrain_app/instance_test/
+.DS_Store

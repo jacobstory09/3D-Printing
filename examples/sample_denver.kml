@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2">
+  <Placemark>
+    <name>Sample project (Denver foothills)</name>
+    <Polygon>
+      <outerBoundaryIs>
+        <LinearRing>
+          <coordinates>
+            -105.05,39.75,0 -104.95,39.75,0 -104.95,39.82,0 -105.05,39.82,0 -105.05,39.75,0
+          </coordinates>
+        </LinearRing>
+      </outerBoundaryIs>
+    </Polygon>
+  </Placemark>
+</kml>
