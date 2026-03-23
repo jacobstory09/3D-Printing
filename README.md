@@ -25,8 +25,6 @@ python run.py
 
 Open http://127.0.0.1:5000
 
-Example KML: `examples/sample_denver.kml`
-
 Processed jobs are cached under `instance/cache/` (Flask’s auto-detected instance folder at the project root).
 
 ## API
@@ -55,3 +53,7 @@ Exports are built from the **same** `dem.npy`, transform, texture, `vertical_exa
 
 - Large `grid_size` and wide areas increase USGS and tile download time.
 - OSM tile usage must follow [OSMF tile policy](https://operations.osmfoundation.org/policies/tiles/) (reasonable traffic, proper User-Agent).
+
+## Known issues
+- Exported file is not clipped to KML boundaries like it is in the terrain viewer
+- Navigating in the terrain viewer is clunky. Click and drag to rotate works well, zoom in/out is broken
