@@ -94,6 +94,9 @@
       opacity: 0.45;
       pointer-events: none;
     }
+    label.sub { margin-top: 0; font-size: 0.65rem; }
+    .print-split-custom { display: none; grid-template-columns: 1fr 1fr; gap: 0.5rem; margin-top: 0.35rem; }
+    .print-split-custom.is-visible { display: grid; }
     .status {
       margin-top: 0.75rem;
       font-size: 0.78rem;
@@ -151,6 +154,24 @@
     <input id="print-base" type="number" min="0" step="0.1" value="2" />
     <label for="print-voxel">Print voxel (mm, optional, finer = slower)</label>
     <input id="print-voxel" type="number" min="0.1" step="0.05" value="" placeholder="auto" />
+    <label for="print-split-preset">Puzzle print grid (splits into multiple STLs that tile in XZ)</label>
+    <select id="print-split-preset" title="Larger area than one bed: use 2x2, 3x3, etc.">
+      <option value="1x1" selected>1×1 (single piece)</option>
+      <option value="2x2">2×2 (4 pieces)</option>
+      <option value="3x3">3×3 (9 pieces)</option>
+      <option value="4x4">4×4 (16 pieces)</option>
+      <option value="custom">Custom…</option>
+    </select>
+    <div id="print-split-custom" class="print-split-custom">
+      <div>
+        <label for="print-split-nx" class="sub">Columns (X)</label>
+        <input id="print-split-nx" type="number" min="1" max="12" value="1" />
+      </div>
+      <div>
+        <label for="print-split-nz" class="sub">Rows (Z)</label>
+        <input id="print-split-nz" type="number" min="1" max="12" value="1" />
+      </div>
+    </div>
     <button id="run" type="button">Build scene</button>
     <div class="status" id="status"></div>
     <div class="exports" id="exports" hidden>
@@ -158,6 +179,7 @@
       <a id="lnk-glb" href="#" download>terrain.glb</a>
       <a id="lnk-zip" href="#" download>terrain_obj.zip</a>
       <a id="lnk-stl" href="#" download>terrain_print.stl (scaled, watertight)</a>
+      <a id="lnk-pieces-zip" href="#" download>terrain_print_pieces.zip (puzzle STLs)</a>
     </div>
   </aside>
   <div id="viewport">

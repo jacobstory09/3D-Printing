@@ -37,6 +37,8 @@ def process_kml(
     print_base_extrusion_mm: float = 2.0,
     print_center_on_bed: bool = True,
     print_voxel_size_mm: float | None = None,
+    print_split_nx: int = 1,
+    print_split_nz: int = 1,
 ) -> str:
     grid_size = int(max(64, min(2048, grid_size)))
     poly_wgs = kml_mod.parse_kml_bytes(kml_bytes)
@@ -128,6 +130,8 @@ def process_kml(
     pbe = float(max(0.0, print_base_extrusion_mm))
     log = logging.getLogger("terrain_app.pipeline")
     print_info: Dict[str, Any] = {}
+    spx = int(max(1, print_split_nx))
+    spz = int(max(1, print_split_nz))
     try:
         print_mesh, print_info = mesh_mod.build_print_solid(
             mesh,
@@ -139,9 +143,38 @@ def process_kml(
         )
         (job_dir / "terrain_print.stl").write_bytes(mesh_mod.export_stl(print_mesh))
         print_info["ok"] = True
+        print_info["split_nx"] = spx
+        print_info["split_nz"] = spz
+        fsm = print_info.get("print_full_size_mm", {})
+        fx = float(fsm.get("x", 0) or 0) if isinstance(fsm, dict) else 0.0
+        fz = float(fsm.get("z", 0) or 0) if isinstance(fsm, dict) else 0.0
+        if spx * spz > 1 and fx > 0 and fz > 0:
+            try:
+                pieces = mesh_mod.split_solid_to_xz_grid(print_mesh, spx, spz)
+                if len(pieces) > 0:
+                    (job_dir / "terrain_print_pieces.zip").write_bytes(
+                        mesh_mod.export_print_pieces_stl_bytes(pieces)
+                    )
+                print_info["pieces"] = {
+                    "ok": bool(len(pieces) > 0),
+                    "count": len(pieces),
+                    "expected": spx * spz,
+                    "per_piece_size_mm": {
+                        "x": fx / spx,
+                        "z": fz / spz,
+                    },
+                }
+            except Exception:
+                log.exception("terrain_print_pieces.zip build failed")
+                print_info["pieces"] = {"error": "print_pieces_export_failed", "ok": False}
     except Exception:
         log.exception("terrain_print.stl build failed")
-        print_info = {"error": "print_solid_export_failed", "ok": False}
+        print_info = {
+            "error": "print_solid_export_failed",
+            "ok": False,
+            "split_nx": spx,
+            "split_nz": spz,
+        }
     meta["print"] = {
         "max_size_mm": pms,
         "base_extrusion_mm": pbe,

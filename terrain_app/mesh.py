@@ -12,6 +12,7 @@ from typing import Any
 import numpy as np
 import rasterio.transform
 import trimesh
+import trimesh.boolean
 from PIL import Image
 from shapely.geometry import Polygon as Polygon2D
 from shapely.prepared import prep
@@ -280,7 +281,14 @@ def build_print_solid(
     sb = solid.bounds
     if sb is not None and sb[0, 1] < 0:
         solid.apply_translation([0.0, -float(sb[0, 1]), 0.0])
+    sb2 = solid.bounds
+    if sb2 is not None:
+        d_mm = (float(sb2[1, 0] - sb2[0, 0]), float(sb2[1, 2] - sb2[0, 2]))
+        w_max_mm = max(d_mm[0], d_mm[1])
+    else:
+        d_mm, w_max_mm = (0.0, 0.0), 0.0
     ext0 = _horizontal_extent_utm_m(surface)
+    w_target = (float(ext0) * s) if ext0 > 0 else 0.0
     meta: dict[str, Any] = {
         "units": "mm",
         "y_up": True,
@@ -288,7 +296,12 @@ def build_print_solid(
         "base_extrusion_mm": be,
         "scale_meters_to_print_mm": float(s),
         "print_voxel_size_mm": float(vs),
-        "print_xy_extent_max_mm": float(min(ext0 * s, print_max_size_mm) if ext0 > 0 else 0.0),
+        "print_xy_extent_max_mm": float(min(w_target, print_max_size_mm) if w_target > 0 else 0.0),
+        "print_full_size_mm": {
+            "x": max(d_mm[0], 0.0),
+            "z": max(d_mm[1], 0.0),
+            "max_horizontal_mm": w_max_mm,
+        },
     }
     return solid, meta
 
@@ -304,3 +317,95 @@ def solid_process_for_export(m: trimesh.Trimesh) -> trimesh.Trimesh:
 
 def export_stl(solid: trimesh.Trimesh) -> bytes:
     return solid.export(file_type="stl")
+
+
+def split_solid_to_xz_grid(
+    solid: trimesh.Trimesh,
+    nx: int,
+    nz: int,
+) -> list[dict[str, Any]]:
+    """
+    Split a closed mesh in **Y-up mm** with axis-aligned XZ cells (``nx`` by ``nz`` in plan).
+    Each cell is a puzzle piece: clip the solid to the XZ box spanning full Y (keeps a flat
+    bottom). Returns dicts with ``id`` (1-based row-major: row ``iz`` south→north, col ``ix``),
+    ``ix`` (0..nx-1), ``iz`` (0..nz-1), and ``mesh``.
+    """
+    nxi = int(max(1, nx))
+    nzi = int(max(1, nz))
+    if solid.is_empty or len(solid.vertices) == 0:
+        return []
+    b = solid.bounds
+    if b is None:
+        return []
+    # Tiny inflation so coplanar boundary faces are included in intersection.
+    pad = 0.02
+    b = np.array(b, dtype=np.float64)
+    b[0, 0] -= pad
+    b[1, 0] += pad
+    b[0, 2] -= pad
+    b[1, 2] += pad
+    b[0, 1] -= pad
+    b[1, 1] += pad
+    out: list[dict[str, Any]] = []
+    total = nxi * nzi
+    for iz in range(nzi):
+        z0 = b[0, 2] + (b[1, 2] - b[0, 2]) * (iz / float(nzi))
+        z1 = b[0, 2] + (b[1, 2] - b[0, 2]) * ((iz + 1) / float(nzi))
+        for ix in range(nxi):
+            x0 = b[0, 0] + (b[1, 0] - b[0, 0]) * (ix / float(nxi))
+            x1 = b[0, 0] + (b[1, 0] - b[0, 0]) * ((ix + 1) / float(nxi))
+            cx, cy, cz = 0.5 * (x0 + x1), 0.5 * (b[0, 1] + b[1, 1]), 0.5 * (z0 + z1)
+            ex, ey, ez = max((x1 - x0), 1e-6), max((b[1, 1] - b[0, 1]), 1e-6), max((z1 - z0), 1e-6)
+            box = trimesh.creation.box(
+                extents=(ex, ey, ez),
+                transform=trimesh.transformations.translation_matrix((float(cx), float(cy), float(cz))),
+            )
+            part = boolean_intersect_safe(solid, box, engine="manifold")
+            if part is None or part.is_empty or len(part.vertices) < 3:
+                continue
+            part = solid_process_for_export(part)
+            if part.is_empty or len(part.vertices) < 3:
+                continue
+            k = 1 + ix + iz * nxi
+            out.append(
+                {
+                    "id": k,
+                    "ix": ix,
+                    "iz": iz,
+                    "row": iz + 1,
+                    "col": ix + 1,
+                    "n_columns": nxi,
+                    "n_rows": nzi,
+                    "index_of_total": k,
+                    "total_pieces": total,
+                    "filename": f"terrain_print_r{iz + 1:02d}c{ix + 1:02d}.stl",
+                    "mesh": part,
+                }
+            )
+    return out
+
+
+def boolean_intersect_safe(
+    a: trimesh.Trimesh, b: trimesh.Trimesh, engine: str = "manifold"
+) -> trimesh.Trimesh | None:
+    try:
+        r = trimesh.boolean.intersection(
+            [a, b], engine=engine, check_volume=False
+        )
+    except Exception:
+        return None
+    if r is None or (hasattr(r, "is_empty") and r.is_empty) or len(r.vertices) < 3:
+        return None
+    return r
+
+
+def export_print_pieces_stl_bytes(pieces: list[dict[str, Any]]) -> bytes:
+    """Zip of one STL per non-empty cell: ``terrain_print_r{row}c{col}.stl`` (1-based, Z then X)."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for p in pieces:
+            m = p["mesh"]
+            name = str(p.get("filename") or f"piece_{p.get('id', 0)}.stl")
+            zf.writestr(name, export_stl(m))
+    buf.seek(0)
+    return buf.read()

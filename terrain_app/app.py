@@ -66,6 +66,14 @@ def create_app() -> Flask:
         except ValueError:
             print_voxel = None
         try:
+            split_nx = int(request.form.get("print_split_nx") or 1)
+        except ValueError:
+            split_nx = 1
+        try:
+            split_nz = int(request.form.get("print_split_nz") or 1)
+        except ValueError:
+            split_nz = 1
+        try:
             job_id = process_kml(
                 data,
                 cache_root,
@@ -76,6 +84,8 @@ def create_app() -> Flask:
                 print_max_size_mm=print_max,
                 print_base_extrusion_mm=print_base,
                 print_voxel_size_mm=print_voxel,
+                print_split_nx=split_nx,
+                print_split_nz=split_nz,
             )
         except ValueError as e:
             return jsonify({"error": str(e)}), 400
@@ -159,6 +169,18 @@ def create_app() -> Flask:
             mimetype="model/stl",
             as_attachment=True,
             download_name="terrain_print.stl",
+        )
+
+    @app.get("/api/result/<job_id>/export_print_pieces.zip")
+    def api_print_pieces_zip(job_id: str):
+        p = cache_root / job_id / "terrain_print_pieces.zip"
+        if not p.is_file():
+            return jsonify({"error": "Not found"}), 404
+        return send_file(
+            p,
+            mimetype="application/zip",
+            as_attachment=True,
+            download_name="terrain_print_pieces.zip",
         )
 
     return app
