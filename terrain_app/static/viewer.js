@@ -5,6 +5,7 @@ const statusEl = document.getElementById("status");
 const exportsEl = document.getElementById("exports");
 const lnkGlb = document.getElementById("lnk-glb");
 const lnkZip = document.getElementById("lnk-zip");
+const lnkStl = document.getElementById("lnk-stl");
 const viewport = document.getElementById("viewport");
 
 let renderer;
@@ -164,6 +165,10 @@ document.getElementById("run").addEventListener("click", async () => {
   fd.append("grid_size", document.getElementById("grid").value);
   fd.append("buffer_m", document.getElementById("buffer").value);
   fd.append("vertical_exaggeration", document.getElementById("vex").value);
+  fd.append("print_max_size_mm", document.getElementById("print-max").value);
+  fd.append("print_base_extrusion_mm", document.getElementById("print-base").value);
+  const voxIn = document.getElementById("print-voxel").value.trim();
+  if (voxIn) fd.append("print_voxel_size_mm", voxIn);
   setStatus("Fetching 3DEP and imagery…");
   exportsEl.hidden = true;
   document.getElementById("run").disabled = true;
@@ -186,12 +191,26 @@ document.getElementById("run").addEventListener("click", async () => {
     await loadScene(meta, heights, texUrl);
     lnkGlb.href = `/api/result/${jobId}/export.glb`;
     lnkZip.href = `/api/result/${jobId}/export.zip`;
+    if (meta.print && meta.print.ok) {
+      lnkStl.href = `/api/result/${jobId}/export.stl`;
+      lnkStl.removeAttribute("aria-disabled");
+    } else {
+      lnkStl.href = "#";
+      lnkStl.setAttribute("aria-disabled", "true");
+    }
     exportsEl.hidden = false;
+    const printLine =
+      meta.print && meta.print.ok
+        ? `Print STL: ${meta.print.print_max_size_mm ?? meta.print.max_size_mm} mm max, base ${meta.print.base_extrusion_mm} mm, voxel ${meta.print.print_voxel_size_mm != null ? meta.print.print_voxel_size_mm : "auto"}\n`
+        : meta.print && (meta.print.error || !meta.print.ok)
+          ? `Print STL: unavailable\n`
+          : "";
     setStatus(
       `EPSG:${meta.epsg} · ${meta.grid_width}×${meta.grid_height}\n` +
         (meta.elevation_min_m != null
           ? `Elev ${meta.elevation_min_m.toFixed(1)}–${meta.elevation_max_m.toFixed(1)} m (raw DEM)\n`
           : "") +
+        printLine +
         `Job ${jobId}`,
     );
   } catch (e) {

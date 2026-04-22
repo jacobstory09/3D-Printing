@@ -1,4 +1,4 @@
-"""Build textured mesh and export GLB / OBJ for Blender."""
+"""Build textured mesh and export GLB / OBJ for Blender, and a print-ready solid."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import io
 import os
 import tempfile
 import zipfile
+from typing import Any
 
 import numpy as np
 import rasterio.transform
@@ -138,3 +139,168 @@ def export_obj_zip(mesh: trimesh.Trimesh) -> bytes:
                     zf.write(p, arcname=os.path.basename(p))
     buf.seek(0)
     return buf.read()
+
+
+# --- Y-up (X east, Y up, Z north) to trimesh’s Z-up (ground XY, +Z extrude / +Z ray tests) ---
+
+# World = (X_east, Y_elev, Z_north) → trimesh: (X_t, Y_t, Z_t) = (X_w, Z_w, Y_w)
+_Y_UP_TO_Z_UP = np.array(
+    [
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ],
+    dtype=np.float64,
+)
+
+
+def _poly_utm_in_extrude_frame(poly_utm: Polygon2D) -> Polygon2D:
+    """(easting, northing) in UTM and trimesh extrude 2D frame are the same (X, Y) before rotation."""
+    return poly_utm
+
+
+def extrude_footprint_solid_utm(
+    poly_utm: Polygon2D,
+    height_m: float,
+) -> trimesh.Trimesh:
+    """
+    Prismatic block under the KML footprint: extrude along -Y in world (down),
+    in UTM units (1 m). Result is in Y-up world coords (X east, Y up, Z north).
+    """
+    if not poly_utm.is_valid or poly_utm.is_empty:
+        raise ValueError("print_base_extrusion_m requires a non-empty KML footprint polygon")
+    h = float(np.abs(float(height_m)))
+    if h <= 0:
+        return trimesh.Trimesh()
+    poly2 = _poly_utm_in_extrude_frame(poly_utm)
+    if not poly2.is_valid:
+        poly2 = poly2.buffer(0)
+    # trimesh extrude along -Z, then R maps that to -Y (down) in our frame
+    block_tm = trimesh.creation.extrude_polygon(
+        poly2, height=-h, engine="earcut"  # -Z in creation frame
+    )
+    out = trimesh.Trimesh(vertices=block_tm.vertices, faces=block_tm.faces, process=True)
+    out.apply_transform(_Y_UP_TO_Z_UP)
+    return out
+
+
+def _horizontal_extent_utm_m(surface: trimesh.Trimesh) -> float:
+    b = surface.bounds
+    if b is None and len(surface.vertices) > 0:
+        v = np.asarray(surface.vertices, dtype=np.float64)
+        b = np.array([v.min(axis=0), v.max(axis=0)], dtype=np.float64)
+    if b is None:
+        return 0.0
+    return float(max(b[1, 0] - b[0, 0], b[1, 2] - b[0, 2]))
+
+
+def _meters_to_print_mm_scale(surface: trimesh.Trimesh, print_max_size_mm: float) -> float:
+    """Meters in scene → millimetre units so the terrain’s max (X/Z) span equals ``print_max_size_mm``."""
+    ext = _horizontal_extent_utm_m(surface)
+    if ext < 1e-9:
+        return 1.0
+    return float(print_max_size_mm) / ext
+
+
+def build_print_solid(
+    surface: trimesh.Trimesh,
+    poly_utm: Polygon2D,
+    print_max_size_mm: float = 200.0,
+    base_extrusion_mm: float = 2.0,
+    center_on_bed: bool = True,
+    voxel_size_mm: float | None = None,
+) -> tuple[trimesh.Trimesh, dict[str, Any]]:
+    """
+    Fuse a prismatic **KML-footprint** base and the terrain skin into a **watertight** print mesh in
+    **millimetres**, Y up, build plate at Y=0. Horizontal scale is chosen from the **surface** so the
+    longer ground edge equals ``print_max_size_mm``. The prismatic block under the footprint is
+    ``base_extrusion_mm`` tall. Open terrain plus base are merged via **voxelization and marching
+    cubes** (trimesh uses scikit-image), since boolean CSG requires closed volumes and the
+    heightfield is not a volume.
+    """
+    if not poly_utm.is_valid:
+        poly_utm = poly_utm.buffer(0)
+    if surface.is_empty or len(surface.vertices) == 0:
+        raise ValueError("Cannot build print solid from empty surface mesh")
+    s = _meters_to_print_mm_scale(surface, print_max_size_mm)
+    # In metres: need depth d such that d * s = base_extrusion_mm
+    be = float(max(0.0, base_extrusion_mm))
+    depth_m = (be / s) if s > 1e-12 and be > 0 else 0.0
+    if depth_m > 0:
+        base_utm = extrude_footprint_solid_utm(poly_utm, depth_m)
+    else:
+        base_utm = trimesh.Trimesh()
+
+    surf = surface.copy()
+    if len(base_utm.vertices) > 0:
+        bms = base_utm.copy()
+        bms.apply_scale(s)
+    else:
+        bms = trimesh.Trimesh()
+    surf.apply_scale(s)
+
+    lo_y = 1e9
+    if len(bms.vertices) > 0:
+        lo_y = min(lo_y, float(bms.bounds[0, 1]))
+    if len(surf.vertices) > 0:
+        lo_y = min(lo_y, float(surf.bounds[0, 1]))
+    t_up = trimesh.transformations.translation_matrix([0.0, -lo_y, 0.0])
+    if len(bms.vertices) > 0:
+        bms.apply_transform(t_up)
+    if len(surf.vertices) > 0:
+        surf.apply_transform(t_up)
+    if center_on_bed:
+        comb = bms + surf
+        cmin, cmax = comb.bounds[0], comb.bounds[1]
+        cx, cz = 0.5 * (cmin[0] + cmax[0]), 0.5 * (cmin[2] + cmax[2])
+        t_center = trimesh.transformations.translation_matrix([-cx, 0.0, -cz])
+        if len(bms.vertices) > 0:
+            bms.apply_transform(t_center)
+        surf.apply_transform(t_center)
+    if len(surf.vertices) == 0:
+        raise ValueError("Surface mesh has no geometry for print export")
+    if len(bms.vertices) == 0:
+        combined = surf
+    else:
+        combined = bms + surf
+    # The terrain is an open heightfield; boolean union requires closed volumes, so we voxelize
+    # and isosurface to a single solid. Ray voxelization (default) assumes +Z; rotate Y-up → Z-up first.
+    vs = float(voxel_size_mm) if (voxel_size_mm is not None and float(voxel_size_mm) > 0) else 0.0
+    if vs <= 0:
+        vs = max(0.25, float(print_max_size_mm) / 150.0)
+    cz = combined.copy()
+    cz.apply_transform(_Y_UP_TO_Z_UP)
+    vg = cz.voxelized(float(vs), method="ray")
+    solid = vg.marching_cubes
+    t_inv = trimesh.transformations.inverse_matrix(_Y_UP_TO_Z_UP)
+    solid.apply_transform(t_inv)
+    solid = solid_process_for_export(solid)
+    # Ray+marching can sit half a voxel below Y=0; rest the solid on the build plate.
+    sb = solid.bounds
+    if sb is not None and sb[0, 1] < 0:
+        solid.apply_translation([0.0, -float(sb[0, 1]), 0.0])
+    ext0 = _horizontal_extent_utm_m(surface)
+    meta: dict[str, Any] = {
+        "units": "mm",
+        "y_up": True,
+        "print_max_size_mm": float(print_max_size_mm),
+        "base_extrusion_mm": be,
+        "scale_meters_to_print_mm": float(s),
+        "print_voxel_size_mm": float(vs),
+        "print_xy_extent_max_mm": float(min(ext0 * s, print_max_size_mm) if ext0 > 0 else 0.0),
+    }
+    return solid, meta
+
+
+def solid_process_for_export(m: trimesh.Trimesh) -> trimesh.Trimesh:
+    t = m.copy()
+    t.update_faces(t.nondegenerate_faces() & t.unique_faces())
+    t.remove_unreferenced_vertices()
+    t.fill_holes()
+    t.merge_vertices(merge_norm=False)
+    return t
+
+
+def export_stl(solid: trimesh.Trimesh) -> bytes:
+    return solid.export(file_type="stl")
