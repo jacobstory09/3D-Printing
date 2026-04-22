@@ -5,6 +5,8 @@ const statusEl = document.getElementById("status");
 const exportsEl = document.getElementById("exports");
 const lnkGlb = document.getElementById("lnk-glb");
 const lnkZip = document.getElementById("lnk-zip");
+const lnkStl = document.getElementById("lnk-stl");
+const lnkPiecesZip = document.getElementById("lnk-pieces-zip");
 const viewport = document.getElementById("viewport");
 
 let renderer;
@@ -12,6 +14,14 @@ let scene;
 let camera;
 let controls;
 let meshGroup;
+
+document.getElementById("print-split-preset")?.addEventListener("change", (ev) => {
+  const wrap = document.getElementById("print-split-custom");
+  if (!wrap) return;
+  const isCustom = ev.target.value === "custom";
+  wrap.classList.toggle("is-visible", isCustom);
+  wrap.hidden = !isCustom;
+});
 
 function setStatus(msg) {
   statusEl.textContent = msg || "";
@@ -164,6 +174,28 @@ document.getElementById("run").addEventListener("click", async () => {
   fd.append("grid_size", document.getElementById("grid").value);
   fd.append("buffer_m", document.getElementById("buffer").value);
   fd.append("vertical_exaggeration", document.getElementById("vex").value);
+  fd.append("print_max_size_mm", document.getElementById("print-max").value);
+  fd.append("print_base_extrusion_mm", document.getElementById("print-base").value);
+  const voxIn = document.getElementById("print-voxel").value.trim();
+  if (voxIn) fd.append("print_voxel_size_mm", voxIn);
+  const preset = document.getElementById("print-split-preset").value;
+  let spx = 1;
+  let spz = 1;
+  if (preset === "2x2") {
+    spx = 2;
+    spz = 2;
+  } else if (preset === "3x3") {
+    spx = 3;
+    spz = 3;
+  } else if (preset === "4x4") {
+    spx = 4;
+    spz = 4;
+  } else if (preset === "custom") {
+    spx = Math.min(12, Math.max(1, parseInt(document.getElementById("print-split-nx").value, 10) || 1));
+    spz = Math.min(12, Math.max(1, parseInt(document.getElementById("print-split-nz").value, 10) || 1));
+  }
+  fd.append("print_split_nx", String(spx));
+  fd.append("print_split_nz", String(spz));
   setStatus("Fetching 3DEP and imagery…");
   exportsEl.hidden = true;
   document.getElementById("run").disabled = true;
@@ -186,12 +218,46 @@ document.getElementById("run").addEventListener("click", async () => {
     await loadScene(meta, heights, texUrl);
     lnkGlb.href = `/api/result/${jobId}/export.glb`;
     lnkZip.href = `/api/result/${jobId}/export.zip`;
+    if (meta.print && meta.print.ok) {
+      lnkStl.href = `/api/result/${jobId}/export.stl`;
+      lnkStl.removeAttribute("aria-disabled");
+    } else {
+      lnkStl.href = "#";
+      lnkStl.setAttribute("aria-disabled", "true");
+    }
+    const pz = meta.print && meta.print.pieces;
+    if (pz && pz.ok && pz.count > 0) {
+      lnkPiecesZip.href = `/api/result/${jobId}/export_print_pieces.zip`;
+      lnkPiecesZip.removeAttribute("aria-disabled");
+    } else {
+      lnkPiecesZip.href = "#";
+      lnkPiecesZip.setAttribute("aria-disabled", "true");
+    }
     exportsEl.hidden = false;
+    const splitDesc =
+      meta.print && (meta.print.split_nx > 1 || meta.print.split_nz > 1)
+        ? `Puzzle: ${meta.print.split_nx}×${meta.print.split_nz} (each tile ≤ bed max)\n`
+        : "";
+    const piecesLine =
+      pz && pz.count > 0
+        ? `Puzzle STLs: ${pz.count} file(s), ~${pz.per_piece_size_mm ? Math.max(pz.per_piece_size_mm.x, pz.per_piece_size_mm.z).toFixed(1) : "?"} mm max on ground\n`
+        : meta.print && (meta.print.split_nx > 1 || meta.print.split_nz > 1)
+          ? `Puzzle STLs: none (split failed or empty)\n`
+          : "";
+    const printLine =
+      meta.print && meta.print.ok
+        ? `Print STL: ${meta.print.print_max_size_mm ?? meta.print.max_size_mm} mm max, base ${meta.print.base_extrusion_mm} mm, voxel ${meta.print.print_voxel_size_mm != null ? meta.print.print_voxel_size_mm : "auto"}\n`
+        : meta.print && (meta.print.error || !meta.print.ok)
+          ? `Print STL: unavailable\n`
+          : "";
     setStatus(
       `EPSG:${meta.epsg} · ${meta.grid_width}×${meta.grid_height}\n` +
         (meta.elevation_min_m != null
           ? `Elev ${meta.elevation_min_m.toFixed(1)}–${meta.elevation_max_m.toFixed(1)} m (raw DEM)\n`
           : "") +
+        splitDesc +
+        piecesLine +
+        printLine +
         `Job ${jobId}`,
     );
   } catch (e) {

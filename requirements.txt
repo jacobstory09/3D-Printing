@@ -8,3 +8,4 @@ pyproj>=3.6.0
 requests>=2.31.0
 mercantile>=1.2.1
 trimesh[easy]>=4.0.0
+scikit-image>=0.22.0

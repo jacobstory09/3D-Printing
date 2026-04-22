@@ -53,6 +53,27 @@ def create_app() -> Flask:
         except ValueError:
             vz = 1.0
         try:
+            print_max = float(request.form.get("print_max_size_mm") or 200)
+        except ValueError:
+            print_max = 200.0
+        try:
+            print_base = float(request.form.get("print_base_extrusion_mm") or 2)
+        except ValueError:
+            print_base = 2.0
+        vox = request.form.get("print_voxel_size_mm")
+        try:
+            print_voxel = float(vox) if (vox is not None and str(vox).strip() != "") else None
+        except ValueError:
+            print_voxel = None
+        try:
+            split_nx = int(request.form.get("print_split_nx") or 1)
+        except ValueError:
+            split_nx = 1
+        try:
+            split_nz = int(request.form.get("print_split_nz") or 1)
+        except ValueError:
+            split_nz = 1
+        try:
             job_id = process_kml(
                 data,
                 cache_root,
@@ -60,6 +81,11 @@ def create_app() -> Flask:
                 grid_size=grid_size,
                 buffer_m=buffer_m,
                 vertical_exaggeration=vz,
+                print_max_size_mm=print_max,
+                print_base_extrusion_mm=print_base,
+                print_voxel_size_mm=print_voxel,
+                print_split_nx=split_nx,
+                print_split_nz=split_nz,
             )
         except ValueError as e:
             return jsonify({"error": str(e)}), 400
@@ -131,6 +157,30 @@ def create_app() -> Flask:
             mimetype="application/zip",
             as_attachment=True,
             download_name="terrain_obj.zip",
+        )
+
+    @app.get("/api/result/<job_id>/export.stl")
+    def api_stl(job_id: str):
+        p = cache_root / job_id / "terrain_print.stl"
+        if not p.is_file():
+            return jsonify({"error": "Not found"}), 404
+        return send_file(
+            p,
+            mimetype="model/stl",
+            as_attachment=True,
+            download_name="terrain_print.stl",
+        )
+
+    @app.get("/api/result/<job_id>/export_print_pieces.zip")
+    def api_print_pieces_zip(job_id: str):
+        p = cache_root / job_id / "terrain_print_pieces.zip"
+        if not p.is_file():
+            return jsonify({"error": "Not found"}), 404
+        return send_file(
+            p,
+            mimetype="application/zip",
+            as_attachment=True,
+            download_name="terrain_print_pieces.zip",
         )
 
     return app
