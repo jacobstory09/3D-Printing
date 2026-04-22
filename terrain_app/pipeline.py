@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import uuid
 from pathlib import Path
 from typing import Any, Dict, Literal
@@ -32,6 +33,10 @@ def process_kml(
     grid_size: int = 512,
     buffer_m: float = 50.0,
     vertical_exaggeration: float = 1.0,
+    print_max_size_mm: float = 200.0,
+    print_base_extrusion_mm: float = 2.0,
+    print_center_on_bed: bool = True,
+    print_voxel_size_mm: float | None = None,
 ) -> str:
     grid_size = int(max(64, min(2048, grid_size)))
     poly_wgs = kml_mod.parse_kml_bytes(kml_bytes)
@@ -119,6 +124,32 @@ def process_kml(
     (job_dir / "terrain.glb").write_bytes(glb)
     zip_bytes = mesh_mod.export_obj_zip(mesh)
     (job_dir / "terrain_obj.zip").write_bytes(zip_bytes)
+    pms = float(max(1.0, print_max_size_mm))
+    pbe = float(max(0.0, print_base_extrusion_mm))
+    log = logging.getLogger("terrain_app.pipeline")
+    print_info: Dict[str, Any] = {}
+    try:
+        print_mesh, print_info = mesh_mod.build_print_solid(
+            mesh,
+            poly_utm,
+            print_max_size_mm=pms,
+            base_extrusion_mm=pbe,
+            center_on_bed=print_center_on_bed,
+            voxel_size_mm=print_voxel_size_mm,
+        )
+        (job_dir / "terrain_print.stl").write_bytes(mesh_mod.export_stl(print_mesh))
+        print_info["ok"] = True
+    except Exception:
+        log.exception("terrain_print.stl build failed")
+        print_info = {"error": "print_solid_export_failed", "ok": False}
+    meta["print"] = {
+        "max_size_mm": pms,
+        "base_extrusion_mm": pbe,
+        "center_on_bed": bool(print_center_on_bed),
+    }
+    if print_voxel_size_mm is not None:
+        meta["print"]["voxel_size_mm_request"] = float(print_voxel_size_mm)
+    meta["print"].update(print_info)
     _save_json(job_dir / "meta.json", meta)
     return job_id
 

@@ -90,6 +90,10 @@
       margin-top: 0.35rem;
       word-break: break-all;
     }
+    .exports a[aria-disabled="true"] {
+      opacity: 0.45;
+      pointer-events: none;
+    }
     .status {
       margin-top: 0.75rem;
       font-size: 0.78rem;
@@ -141,16 +145,23 @@
     <input id="buffer" type="number" min="0" value="80" />
     <label for="vex">Vertical exaggeration</label>
     <input id="vex" type="number" min="0.01" step="0.05" value="1" />
+    <label for="print-max">3D print max size (mm)</label>
+    <input id="print-max" type="number" min="1" step="1" value="200" title="Scales the terrain so the longer horizontal side matches this" />
+    <label for="print-base">Base extrude down (mm, flat for printing)</label>
+    <input id="print-base" type="number" min="0" step="0.1" value="2" />
+    <label for="print-voxel">Print voxel (mm, optional, finer = slower)</label>
+    <input id="print-voxel" type="number" min="0.1" step="0.05" value="" placeholder="auto" />
     <button id="run" type="button">Build scene</button>
     <div class="status" id="status"></div>
     <div class="exports" id="exports" hidden>
       <strong>Export</strong>
       <a id="lnk-glb" href="#" download>terrain.glb</a>
       <a id="lnk-zip" href="#" download>terrain_obj.zip</a>
+      <a id="lnk-stl" href="#" download>terrain_print.stl (scaled, watertight)</a>
     </div>
   </aside>
   <div id="viewport">
-    <div class="hint">Elevation (Y) uses min-subtracted meters × exaggeration · X/Z = UTM easting/northing (m). Satellite: Esri, Maxar, Earthstar, GIS community. OSM © contributors. OAM = dataset license.</div>
+    <div class="hint">Web preview: elevation (Y) in meters (min-subtracted) × exaggeration, X/Z = UTM. STL export: mm, centered on the bed, with a solid base. Satellite: Esri, Maxar, Earthstar, GIS community. OSM © contributors. OAM = dataset license.</div>
   </div>
   <script type="module" src="{{ url_for('static', filename='viewer.js') }}"></script>
 </body>
