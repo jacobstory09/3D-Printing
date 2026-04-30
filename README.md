@@ -39,15 +39,15 @@ Processed jobs are cached under `instance/cache/` (Flask’s auto-detected insta
 
 ### Export vs preview
 
-Exports are built from the **same** `dem.npy`, transform, texture, `vertical_exaggeration`, and `prepare_z` logic as the viewer—there is no separate sample mesh. Vertices use **Y-up** to match Three.js: **X = UTM easting**, **Y = display elevation** (min removed × exaggeration), **Z = UTM northing** (meters).
+Exports are built from the **same** `dem.npy`, transform, texture, `vertical_exaggeration`, and `prepare_z` logic as the viewer—there is no separate sample mesh. Vertices use **Z-up**: **X = UTM easting**, **Y = UTM northing**, **Z = display elevation** (min removed × exaggeration), in metres for terrain GLB/OBJ and millimetres for print files.
 
 **Blender (4.x):**
 
 - Prefer **`terrain.glb`**: File → Import → glTF 2.0. Use **Material Preview** or **Rendered** viewport shading; **Solid** shows only gray geometry (no satellite), which matches a shaded DEM, not “missing” data.
 - **`terrain_obj.zip`**: Extract **all** files to one folder (`terrain.obj`, `material.mtl`, `material_0.png`). Import the `.obj` from that folder so `map_Kd material_0.png` resolves. The ZIP is a normal archive (OBJ + MTL + PNG); it is generated on each build from the same mesh as the GLB.
-- Vertex coordinates are **large** (real UTM meters, e.g. hundreds of thousands). Avoid ad‑hoc **0.001 scale** or **90° X rotation** unless you intend to change orientation; those transforms make the object **no longer match** the web preview frame. For a 1:1 match with the app, keep rotation **0°** and scale **1** on import, then orbit the camera (Y-up ground plane = **XZ**).
+- Vertex coordinates are **large** (real UTM metres, e.g. hundreds of thousands). Avoid ad‑hoc **0.001 scale** or **90° rotations** unless you intend to change orientation. For a 1:1 match with the app, keep rotation **0°** and scale **1** on import; the ground plane is **XY** and **Z** is up.
 
-**KML clipping:** The web viewer uses a **full rectangle** mesh plus **alpha discard** on the texture. **Exports (GLB + OBJ)** drop faces whose **UTM ground quad** does not **intersect the KML polygon** (Shapely), so the mesh outline follows the boundary instead of the data rectangle. Texture **RGBA** still uses the raster mask for alpha. Large jobs (e.g. 1000×700+) may take ~10–20s longer while culling faces. Use **Alpha Clip** in Blender if needed for texture edges.
+**KML clipping:** The web viewer triangulates the **same quads** as **exports (GLB + OBJ)**: only faces whose **UTM ground quad** intersects the KML polygon (Shapely). Texture **RGBA** still uses the raster mask for alpha. Large jobs (e.g. 1000×700+) may take longer while culling faces. Use **Alpha Clip** in Blender if needed for texture edges.
 
 ## Notes
 

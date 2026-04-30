@@ -34,7 +34,7 @@ def process_kml(
     buffer_m: float = 50.0,
     vertical_exaggeration: float = 1.0,
     print_max_size_mm: float = 200.0,
-    print_base_extrusion_mm: float = 2.0,
+    print_base_extrusion_mm: float = 1.0,
     print_center_on_bed: bool = True,
     print_voxel_size_mm: float | None = None,
     print_split_nx: int = 1,
@@ -113,6 +113,7 @@ def process_kml(
     if finite.any():
         meta["elevation_min_m"] = float(np.nanmin(dem[finite]))
         meta["elevation_max_m"] = float(np.nanmax(dem[finite]))
+        meta["full_raster_relief_m"] = float(meta["elevation_max_m"] - meta["elevation_min_m"])
     mesh = mesh_mod.build_mesh(
         dem,
         texture,
@@ -122,9 +123,33 @@ def process_kml(
         mask=mask,
         poly_utm=poly_utm,
     )
-    glb = mesh_mod.export_glb(mesh)
+    mb = mesh.bounds
+    if mb is not None:
+        meta["clipped_surface_relief_m"] = float(mb[1, 2] - mb[0, 2])
+    # DEM → prepare_z (× vertical_exaggeration) is stored on mesh vertex **Z** (index 2).
+    meta["elevation_axis"] = {
+        "dem_to_mesh_column": 2,
+        "mesh_axis_name": "Z",
+        "description": "X=UTM easting, Y=UTM northing, Z=elevation (m); print files use the same Z-up frame in mm",
+    }
+    z_for_stats = mesh_mod.prepare_z(
+        dem, vertical_exaggeration=vertical_exaggeration, z_offset_mode="min"
+    )
+    inside = mask >= 128
+    if np.any(inside):
+        meta["masked_raster_relief_m"] = float(np.ptp(z_for_stats[inside]))
+    mv = np.asarray(mesh.vertices, dtype=np.float64)
+    if mv.size > 0:
+        meta["mesh_vertex_z_span_m"] = float(np.ptp(mv[:, 2]))
+    if dem.shape[0] > 1 and dem.shape[1] > 1:
+        qmask = mesh_mod.quad_inclusion_mask(
+            int(dem.shape[0]), int(dem.shape[1]), dst_transform, poly_utm, mask
+        )
+        (job_dir / "quad_mask.bin").write_bytes(np.ascontiguousarray(qmask).tobytes())
+        meta["quad_mask"] = {"url": f"/api/result/{job_id}/quad_mask.bin"}
+    glb = mesh_mod.export_glb(mesh, center_xz=True)
     (job_dir / "terrain.glb").write_bytes(glb)
-    zip_bytes = mesh_mod.export_obj_zip(mesh)
+    zip_bytes = mesh_mod.export_obj_zip(mesh, center_xz=True)
     (job_dir / "terrain_obj.zip").write_bytes(zip_bytes)
     pms = float(max(1.0, print_max_size_mm))
     pbe = float(max(0.0, print_base_extrusion_mm))
@@ -133,7 +158,7 @@ def process_kml(
     spx = int(max(1, print_split_nx))
     spz = int(max(1, print_split_nz))
     try:
-        print_mesh, print_info = mesh_mod.build_print_solid(
+        print_mesh, print_info, surf_mm = mesh_mod.build_print_solid(
             mesh,
             poly_utm,
             print_max_size_mm=pms,
@@ -141,14 +166,36 @@ def process_kml(
             center_on_bed=print_center_on_bed,
             voxel_size_mm=print_voxel_size_mm,
         )
-        (job_dir / "terrain_print.stl").write_bytes(mesh_mod.export_stl(print_mesh))
+        pmb = print_mesh.bounds
+        if pmb is not None:
+            print_info["print_vertical_span_mm"] = float(pmb[1, 2] - pmb[0, 2])
+        (job_dir / "terrain_print.stl").write_bytes(mesh_mod.export_print_stl(print_mesh))
+        (job_dir / "terrain_print.glb").write_bytes(mesh_mod.export_print_glb(print_mesh))
+        mesh_3mf = mesh_mod.print_solid_with_satellite_uv(print_mesh, surf_mm)
+        raw_3mf = mesh_mod.export_print_3mf(mesh_3mf)
+        (job_dir / "terrain_print.3mf").write_bytes(raw_3mf)
+        print_info["print_3mf_textured"] = bool(
+            mesh_3mf.visual is not None
+            and mesh_3mf.visual.defined
+            and getattr(mesh_3mf.visual, "kind", None) == "texture"
+        )
+        try:
+            reloaded = mesh_mod.mesh_from_3mf_bytes(raw_3mf)
+            print_info["print_3mf_roundtrip_non_manifold_edge_count"] = int(
+                mesh_mod.non_manifold_edge_count(reloaded)
+            )
+        except Exception:
+            log.exception("3MF round-trip topology check failed")
+            print_info["print_3mf_roundtrip_non_manifold_edge_count"] = None
         print_info["ok"] = True
+        print_info["export_frame"] = "slicer_z_up"
+        print_info["export_axes"] = "X=east_mm, Y=north_mm, Z=elevation_mm (XY build plate, Z up)"
         print_info["split_nx"] = spx
         print_info["split_nz"] = spz
         fsm = print_info.get("print_full_size_mm", {})
         fx = float(fsm.get("x", 0) or 0) if isinstance(fsm, dict) else 0.0
-        fz = float(fsm.get("z", 0) or 0) if isinstance(fsm, dict) else 0.0
-        if spx * spz > 1 and fx > 0 and fz > 0:
+        fy = float(fsm.get("y", 0) or fsm.get("z", 0) or 0) if isinstance(fsm, dict) else 0.0
+        if spx * spz > 1 and fx > 0 and fy > 0:
             try:
                 pieces = mesh_mod.split_solid_to_xz_grid(print_mesh, spx, spz)
                 if len(pieces) > 0:
@@ -161,7 +208,7 @@ def process_kml(
                     "expected": spx * spz,
                     "per_piece_size_mm": {
                         "x": fx / spx,
-                        "z": fz / spz,
+                        "y": fy / spz,
                     },
                 }
             except Exception:

@@ -6,6 +6,8 @@ const exportsEl = document.getElementById("exports");
 const lnkGlb = document.getElementById("lnk-glb");
 const lnkZip = document.getElementById("lnk-zip");
 const lnkStl = document.getElementById("lnk-stl");
+const lnkPrintGlb = document.getElementById("lnk-print-glb");
+const lnk3mf = document.getElementById("lnk-3mf");
 const lnkPiecesZip = document.getElementById("lnk-pieces-zip");
 const viewport = document.getElementById("viewport");
 
@@ -42,7 +44,7 @@ async function fetchHeights(url) {
   return new Float32Array(ab);
 }
 
-function buildGeometry(meta, heights) {
+function buildGeometry(meta, heights, quadMask) {
   const w = meta.grid_width;
   const h = meta.grid_height;
   const [a, b, c, d, e, f] = meta.transform;
@@ -56,8 +58,8 @@ function buildGeometry(meta, heights) {
   for (let i = 0; i < h; i++) {
     for (let j = 0; j < w; j++) {
       const x = a * j + b * i + c;
-      const z = d * j + e * i + f;
-      const y = heights[i * w + j];
+      const y = d * j + e * i + f;
+      const z = heights[i * w + j];
       pos[p++] = x;
       pos[p++] = y;
       pos[p++] = z;
@@ -67,8 +69,10 @@ function buildGeometry(meta, heights) {
   }
   const idx = [];
   const vid = (i, j) => i * w + j;
+  const qmw = w - 1;
   for (let i = 0; i < h - 1; i++) {
     for (let j = 0; j < w - 1; j++) {
+      if (quadMask && !quadMask[i * qmw + j]) continue;
       const v00 = vid(i, j);
       const v10 = vid(i + 1, j);
       const v01 = vid(i, j + 1);
@@ -89,6 +93,7 @@ function initThree() {
   scene = new THREE.Scene();
   scene.background = new THREE.Color(0x0f1218);
   camera = new THREE.PerspectiveCamera(50, 1, 0.5, 1e9);
+  camera.up.set(0, 0, 1);
   renderer = new THREE.WebGLRenderer({ antialias: true });
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
   viewport.appendChild(renderer.domElement);
@@ -97,7 +102,7 @@ function initThree() {
   const amb = new THREE.AmbientLight(0xffffff, 0.55);
   scene.add(amb);
   const dir = new THREE.DirectionalLight(0xffffff, 0.85);
-  dir.position.set(1, 2, 1);
+  dir.position.set(1, 1, 2);
   scene.add(dir);
   meshGroup = new THREE.Group();
   scene.add(meshGroup);
@@ -134,10 +139,10 @@ function clearMesh() {
   }
 }
 
-async function loadScene(meta, heights, textureUrl) {
+async function loadScene(meta, heights, textureUrl, quadMask) {
   initThree();
   clearMesh();
-  const geo = buildGeometry(meta, heights);
+  const geo = buildGeometry(meta, heights, quadMask);
   const tex = await new THREE.TextureLoader().loadAsync(textureUrl);
   tex.colorSpace = THREE.SRGBColorSpace;
   tex.flipY = false;
@@ -156,7 +161,7 @@ async function loadScene(meta, heights, textureUrl) {
   const bs = geo.boundingSphere;
   const center = bs.center.clone();
   const r = Math.max(bs.radius, 50);
-  camera.position.set(center.x + r * 1.2, center.y + r * 0.9, center.z + r * 1.2);
+  camera.position.set(center.x + r * 1.1, center.y + r * 1.1, center.z + r * 0.45);
   controls.target.copy(center);
   controls.update();
 }
@@ -177,7 +182,10 @@ document.getElementById("run").addEventListener("click", async () => {
   fd.append("print_max_size_mm", document.getElementById("print-max").value);
   fd.append("print_base_extrusion_mm", document.getElementById("print-base").value);
   const voxIn = document.getElementById("print-voxel").value.trim();
-  if (voxIn) fd.append("print_voxel_size_mm", voxIn);
+  const voxNum = voxIn === "" ? NaN : Number(voxIn);
+  if (voxIn && voxIn.toLowerCase() !== "auto" && voxNum > 0) {
+    fd.append("print_voxel_size_mm", voxIn);
+  }
   const preset = document.getElementById("print-split-preset").value;
   let spx = 1;
   let spz = 1;
@@ -214,24 +222,60 @@ document.getElementById("run").addEventListener("click", async () => {
     } else {
       heights = await fetchHeights(rj.heights.url);
     }
+    let quadMask = null;
+    const qm = meta.quad_mask && meta.quad_mask.url;
+    if (qm) {
+      const qr = await fetch(qm);
+      if (qr.ok) {
+        const buf = new Uint8Array(await qr.arrayBuffer());
+        const gw = meta.grid_width;
+        const gh = meta.grid_height;
+        const expected = (gw - 1) * (gh - 1);
+        if (buf.length === expected) quadMask = buf;
+      }
+    }
     const texUrl = rj.textures.rgba;
-    await loadScene(meta, heights, texUrl);
-    lnkGlb.href = `/api/result/${jobId}/export.glb`;
-    lnkZip.href = `/api/result/${jobId}/export.zip`;
+    await loadScene(meta, heights, texUrl, quadMask);
+    if (lnkGlb) lnkGlb.href = `/api/result/${jobId}/export.glb`;
+    if (lnkZip) lnkZip.href = `/api/result/${jobId}/export.zip`;
     if (meta.print && meta.print.ok) {
-      lnkStl.href = `/api/result/${jobId}/export.stl`;
-      lnkStl.removeAttribute("aria-disabled");
+      if (lnkStl) {
+        lnkStl.href = `/api/result/${jobId}/export.stl`;
+        lnkStl.removeAttribute("aria-disabled");
+      }
+      if (lnkPrintGlb) {
+        lnkPrintGlb.href = `/api/result/${jobId}/export_print.glb`;
+        lnkPrintGlb.removeAttribute("aria-disabled");
+      }
+      if (lnk3mf) {
+        lnk3mf.href = `/api/result/${jobId}/export.3mf`;
+        lnk3mf.removeAttribute("aria-disabled");
+      }
     } else {
-      lnkStl.href = "#";
-      lnkStl.setAttribute("aria-disabled", "true");
+      if (lnkStl) {
+        lnkStl.href = "#";
+        lnkStl.setAttribute("aria-disabled", "true");
+      }
+      if (lnkPrintGlb) {
+        lnkPrintGlb.href = "#";
+        lnkPrintGlb.setAttribute("aria-disabled", "true");
+      }
+      if (lnk3mf) {
+        lnk3mf.href = "#";
+        lnk3mf.setAttribute("aria-disabled", "true");
+      }
     }
     const pz = meta.print && meta.print.pieces;
     if (pz && pz.ok && pz.count > 0) {
-      lnkPiecesZip.href = `/api/result/${jobId}/export_print_pieces.zip`;
-      lnkPiecesZip.removeAttribute("aria-disabled");
+      if (lnkPiecesZip) {
+        lnkPiecesZip.href = `/api/result/${jobId}/export_print_pieces.zip`;
+        lnkPiecesZip.removeAttribute("aria-disabled");
+      }
     } else {
-      lnkPiecesZip.href = "#";
-      lnkPiecesZip.setAttribute("aria-disabled", "true");
+      if (lnkPiecesZip) {
+        lnkPiecesZip.href = "#";
+        lnkPiecesZip.setAttribute("aria-disabled", "true");
+      }
     }
     exportsEl.hidden = false;
     const splitDesc =
@@ -240,24 +284,71 @@ document.getElementById("run").addEventListener("click", async () => {
         : "";
     const piecesLine =
       pz && pz.count > 0
-        ? `Puzzle STLs: ${pz.count} file(s), ~${pz.per_piece_size_mm ? Math.max(pz.per_piece_size_mm.x, pz.per_piece_size_mm.z).toFixed(1) : "?"} mm max on ground\n`
+        ? `Puzzle STLs: ${pz.count} file(s), ~${pz.per_piece_size_mm ? Math.max(pz.per_piece_size_mm.x, pz.per_piece_size_mm.y ?? pz.per_piece_size_mm.z ?? 0).toFixed(1) : "?"} mm max on ground\n`
         : meta.print && (meta.print.split_nx > 1 || meta.print.split_nz > 1)
           ? `Puzzle STLs: none (split failed or empty)\n`
           : "";
     const printLine =
       meta.print && meta.print.ok
-        ? `Print STL: ${meta.print.print_max_size_mm ?? meta.print.max_size_mm} mm max, base ${meta.print.base_extrusion_mm} mm, voxel ${meta.print.print_voxel_size_mm != null ? meta.print.print_voxel_size_mm : "auto"}\n`
+        ? `Print STL: ${meta.print.print_max_size_mm ?? meta.print.max_size_mm} mm max, base ${meta.print.base_extrusion_mm} mm, voxel ${
+            meta.print.voxel_size_mm_request != null
+              ? meta.print.voxel_size_mm_request
+              : meta.print.print_voxel_size_mm != null
+                ? `auto (~${Number(meta.print.print_voxel_size_mm).toFixed(2)} mm)`
+                : "auto"
+          }${
+            meta.print.print_vertical_span_mm != null
+              ? `, model height ~${Number(meta.print.print_vertical_span_mm).toFixed(2)} mm (slicer Z)`
+              : ""
+          }\n`
         : meta.print && (meta.print.error || !meta.print.ok)
           ? `Print STL: unavailable\n`
           : "";
+    const multiBodyWarn =
+      meta.print && meta.print.ok && meta.print.print_component_count > 1
+        ? `Warning: print mesh has ${meta.print.print_component_count} separate bodies (expected one)\n`
+        : "";
+    const fullRel = meta.full_raster_relief_m;
+    const clipRel = meta.clipped_surface_relief_m;
+    const reliefHint =
+      fullRel != null &&
+      clipRel != null &&
+      fullRel > 1 &&
+      clipRel < 0.05 * fullRel
+        ? `Note: KML footprint is much flatter than the full download tile; preview matches print.\n`
+        : "";
+    const vex = meta.vertical_exaggeration != null ? Number(meta.vertical_exaggeration) : 1;
+    const meshZSpan =
+      meta.mesh_vertex_z_span_m != null
+        ? meta.mesh_vertex_z_span_m
+        : meta.mesh_vertex_y_span_m != null
+          ? meta.mesh_vertex_y_span_m
+          : null;
+    const meshZLine =
+      meshZSpan != null
+        ? `Terrain mesh: DEM → vertex Z span ${Number(meshZSpan).toFixed(2)} m (×${vex} vex); same Z in print STL (mm after scaling).\n`
+        : "";
+    const maskR = meta.masked_raster_relief_m;
+    const meshZForWarn = meshZSpan;
+    const reliefMismatch =
+      maskR != null &&
+      meshZForWarn != null &&
+      maskR > 0.5 &&
+      meshZForWarn < 0.05 * maskR
+        ? `Warning: footprint DEM varies ~${Number(maskR).toFixed(2)} m but triangulated mesh only ~${Number(meshZForWarn).toFixed(2)} m—possible polygon vs grid mismatch.\n`
+        : "";
     setStatus(
       `EPSG:${meta.epsg} · ${meta.grid_width}×${meta.grid_height}\n` +
         (meta.elevation_min_m != null
           ? `Elev ${meta.elevation_min_m.toFixed(1)}–${meta.elevation_max_m.toFixed(1)} m (raw DEM)\n`
           : "") +
+        meshZLine +
+        reliefMismatch +
+        reliefHint +
         splitDesc +
         piecesLine +
         printLine +
+        multiBodyWarn +
         `Job ${jobId}`,
     );
   } catch (e) {

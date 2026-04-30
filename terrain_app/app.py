@@ -52,17 +52,22 @@ def create_app() -> Flask:
             vz = float(request.form.get("vertical_exaggeration") or 1)
         except ValueError:
             vz = 1.0
+        vz = max(0.01, vz)
         try:
             print_max = float(request.form.get("print_max_size_mm") or 200)
         except ValueError:
             print_max = 200.0
         try:
-            print_base = float(request.form.get("print_base_extrusion_mm") or 2)
+            print_base = float(request.form.get("print_base_extrusion_mm") or 1)
         except ValueError:
-            print_base = 2.0
+            print_base = 1.0
         vox = request.form.get("print_voxel_size_mm")
         try:
-            print_voxel = float(vox) if (vox is not None and str(vox).strip() != "") else None
+            if vox is None or str(vox).strip() == "":
+                print_voxel = None
+            else:
+                pv = float(vox)
+                print_voxel = pv if pv > 0 else None
         except ValueError:
             print_voxel = None
         try:
@@ -140,6 +145,14 @@ def create_app() -> Flask:
         arr = np.load(p)
         return Response(arr.astype(np.float32).tobytes(), mimetype="application/octet-stream")
 
+    @app.get("/api/result/<job_id>/quad_mask.bin")
+    def api_quad_mask(job_id: str):
+        """Quad inclusion (h-1)×(w-1) uint8 row-major, same rules as print mesh / build_mesh."""
+        p = cache_root / job_id / "quad_mask.bin"
+        if not p.is_file():
+            return jsonify({"error": "Not found"}), 404
+        return send_file(p, mimetype="application/octet-stream")
+
     @app.get("/api/result/<job_id>/export.glb")
     def api_glb(job_id: str):
         p = cache_root / job_id / "terrain.glb"
@@ -169,6 +182,31 @@ def create_app() -> Flask:
             mimetype="model/stl",
             as_attachment=True,
             download_name="terrain_print.stl",
+        )
+
+    @app.get("/api/result/<job_id>/export_print.glb")
+    def api_print_glb(job_id: str):
+        """Same watertight print solid as STL/3MF, as glTF binary (no satellite texture)."""
+        p = cache_root / job_id / "terrain_print.glb"
+        if not p.is_file():
+            return jsonify({"error": "Not found"}), 404
+        return send_file(
+            p,
+            mimetype="model/gltf-binary",
+            as_attachment=True,
+            download_name="terrain_print.glb",
+        )
+
+    @app.get("/api/result/<job_id>/export.3mf")
+    def api_3mf(job_id: str):
+        p = cache_root / job_id / "terrain_print.3mf"
+        if not p.is_file():
+            return jsonify({"error": "Not found"}), 404
+        return send_file(
+            p,
+            mimetype="model/3mf",
+            as_attachment=True,
+            download_name="terrain_print.3mf",
         )
 
     @app.get("/api/result/<job_id>/export_print_pieces.zip")
