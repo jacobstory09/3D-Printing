@@ -4,10 +4,9 @@ from __future__ import annotations
 
 import glob
 import io
-import json
 import os
 import tempfile
-import time
+import xml.etree.ElementTree as ET
 import zipfile
 from typing import Any
 
@@ -15,43 +14,107 @@ import numpy as np
 import rasterio.transform
 import trimesh
 import trimesh.boolean
+import trimesh.creation
 import trimesh.repair
 from PIL import Image
+from scipy.ndimage import gaussian_filter
 from scipy.spatial import cKDTree
 from shapely.geometry import Polygon as Polygon2D
+from shapely.geometry.base import BaseGeometry
 from shapely.prepared import prep
 
-# region agent log
-# Use package-local log (`.cursor/...` may be unwritable in some sandboxes; copy to .cursor for IDE ingest if needed).
-_AGENT_DEBUG_LOG = os.path.abspath(os.path.join(os.path.dirname(__file__), "debug-0a1df2.log"))
+
+def default_boundary_smooth_m(
+    bounds_utm: tuple[float, float, float, float],
+    grid_width: int,
+    grid_height: int,
+) -> float:
+    """~0.75× the larger DEM cell size (m); softens grid-aligned KML stair-steps."""
+    west, south, east, north = bounds_utm
+    dx = (east - west) / max(int(grid_width) - 1, 1)
+    dy = (north - south) / max(int(grid_height) - 1, 1)
+    return 0.75 * float(max(dx, dy))
 
 
-def _agent_debug_log(
-    *,
-    hypothesis_id: str,
-    location: str,
-    message: str,
-    data: dict[str, Any],
-    run_id: str = "pre-fix",
-) -> None:
+def smooth_clip_polygon(poly: Polygon2D, smooth_m: float) -> Polygon2D:
+    """Round corners via outward buffer then inward buffer (morphological smooth)."""
+    d = float(smooth_m)
+    if d <= 0 or poly.is_empty:
+        return poly
     try:
-        os.makedirs(os.path.dirname(_AGENT_DEBUG_LOG), exist_ok=True)
-        payload = {
-            "sessionId": "0a1df2",
-            "runId": run_id,
-            "hypothesisId": hypothesis_id,
-            "location": location,
-            "message": message,
-            "data": data,
-            "timestamp": int(time.time() * 1000),
-        }
-        with open(_AGENT_DEBUG_LOG, "a", encoding="utf-8") as _df:
-            _df.write(json.dumps(payload, separators=(",", ":")) + "\n")
-    except OSError:
-        pass
+        segs = max(16, min(48, int(12 + d * 2.0)))
+        out: BaseGeometry = poly.buffer(d, join_style="round", quad_segs=segs).buffer(
+            -d, join_style="round", quad_segs=segs
+        )
+    except Exception:
+        return poly
+    if out.is_empty:
+        return poly
+    if out.geom_type == "MultiPolygon":
+        out = max(out.geoms, key=lambda g: g.area)
+    if not isinstance(out, Polygon2D) or out.is_empty:
+        return poly
+    if not out.is_valid:
+        out = out.buffer(0)
+    return out
 
 
-# endregion
+def soften_raster_mask_alpha(mask: np.ndarray, sigma_px: float = 1.25) -> np.ndarray:
+    """Gaussian blur for texture alpha only; does not change mesh/print clipping."""
+    if mask is None or sigma_px <= 0:
+        return mask
+    blurred = gaussian_filter(mask.astype(np.float64), sigma=float(sigma_px))
+    return np.clip(blurred, 0.0, 255.0).astype(np.uint8)
+
+
+def resolve_boundary_clipping(
+    poly_utm: Polygon2D,
+    dem_shape: tuple[int, int],
+    transform,
+    bounds_utm: tuple[float, float, float, float],
+    grid_width: int,
+    grid_height: int,
+    boundary_smooth_m: float | None,
+) -> tuple[np.ndarray, Polygon2D | None, float]:
+    """
+    Build mask + clip polygon for :func:`build_mesh` / :func:`quad_inclusion_mask`.
+
+    When smoothing is on, quads clip via a rounded **polygon** (``smooth_clip_polygon``).
+    The returned mask is a softened alpha channel for the texture only—not used for
+    quad inclusion, which avoids fringe cells and broken print side walls.
+    """
+    from rasterio.features import rasterize
+
+    h, w = int(dem_shape[0]), int(dem_shape[1])
+    smooth_m = (
+        default_boundary_smooth_m(bounds_utm, grid_width, grid_height)
+        if boundary_smooth_m is None
+        else float(boundary_smooth_m)
+    )
+    if smooth_m <= 0:
+        mask = rasterize(
+            [(poly_utm, 255)],
+            out_shape=(h, w),
+            transform=transform,
+            fill=0,
+            dtype=np.uint8,
+            all_touched=True,
+        )
+        return mask, poly_utm, 0.0
+    poly_clip = smooth_clip_polygon(poly_utm, smooth_m)
+    mask = rasterize(
+        [(poly_clip, 255)],
+        out_shape=(h, w),
+        transform=transform,
+        fill=0,
+        dtype=np.uint8,
+        all_touched=True,
+    )
+    west, south, east, north = bounds_utm
+    cell_m = max((east - west) / max(w - 1, 1), (north - south) / max(h - 1, 1))
+    sigma_px = max(0.75, float(smooth_m) / max(cell_m, 1e-9))
+    mask = soften_raster_mask_alpha(mask, sigma_px=sigma_px)
+    return mask, poly_clip, smooth_m
 
 
 def _cell_center_east_north(transform, h: int, w: int) -> tuple[np.ndarray, np.ndarray]:
@@ -100,6 +163,177 @@ def _include_quad(
         blk = mask[i : i + 2, j : j + 2]
         return bool(np.any(blk >= 128))
     return True
+
+
+_CLIP_XY_ROUND = 3  # 0.001 m for UTM-scale coordinates
+_CORNER_TOL_M = 1e-4
+
+
+def _xy_key(x: float, y: float) -> tuple[float, float]:
+    return (round(float(x), _CLIP_XY_ROUND), round(float(y), _CLIP_XY_ROUND))
+
+
+def _point_in_tri_2d(
+    p: np.ndarray, a: np.ndarray, b: np.ndarray, c: np.ndarray, eps: float = 1e-12
+) -> bool:
+    v0 = c - a
+    v1 = b - a
+    v2 = p - a
+    d00 = float(np.dot(v0, v0))
+    d01 = float(np.dot(v0, v1))
+    d11 = float(np.dot(v1, v1))
+    d20 = float(np.dot(v2, v0))
+    d21 = float(np.dot(v2, v1))
+    den = d00 * d11 - d01 * d01
+    if abs(den) < eps:
+        return False
+    v = (d11 * d20 - d01 * d21) / den
+    w = (d00 * d21 - d01 * d20) / den
+    u = 1.0 - v - w
+    return u >= -eps and v >= -eps and w >= -eps
+
+
+def _height_uv_at_xy(
+    x: float,
+    y: float,
+    i: int,
+    j: int,
+    east: np.ndarray,
+    north: np.ndarray,
+    z: np.ndarray,
+    w: int,
+    h: int,
+) -> tuple[float, float, float]:
+    """Barycentric height + UV inside DEM cell ``(i, j)`` (two-triangle split)."""
+    p00 = np.array([east[i, j], north[i, j]], dtype=np.float64)
+    p10 = np.array([east[i + 1, j], north[i + 1, j]], dtype=np.float64)
+    p01 = np.array([east[i, j + 1], north[i, j + 1]], dtype=np.float64)
+    p11 = np.array([east[i + 1, j + 1], north[i + 1, j + 1]], dtype=np.float64)
+    z00, z10, z01, z11 = float(z[i, j]), float(z[i + 1, j]), float(z[i, j + 1]), float(z[i + 1, j + 1])
+    u00 = (j + 0.5) / w
+    v00 = 1.0 - (i + 0.5) / h
+    u10 = (j + 0.5) / w
+    v10 = 1.0 - (i + 1.5) / h
+    u01 = (j + 1.5) / w
+    v01 = 1.0 - (i + 0.5) / h
+    u11 = (j + 1.5) / w
+    v11 = 1.0 - (i + 1.5) / h
+    p = np.array([x, y], dtype=np.float64)
+    for tri, zs, us, vs in (
+        ((p00, p10, p01), (z00, z10, z01), (u00, u10, u01), (v00, v10, v01)),
+        ((p10, p11, p01), (z10, z11, z01), (u10, u11, u01), (v10, v11, v01)),
+    ):
+        a, b, c = tri
+        if not _point_in_tri_2d(p, a, b, c):
+            continue
+        v0 = c - a
+        v1 = b - a
+        v2 = p - a
+        d00 = float(np.dot(v0, v0))
+        d01 = float(np.dot(v0, v1))
+        d11 = float(np.dot(v1, v1))
+        d20 = float(np.dot(v2, v0))
+        d21 = float(np.dot(v2, v1))
+        den = d00 * d11 - d01 * d01
+        v = (d11 * d20 - d01 * d21) / den
+        wgt = (d00 * d21 - d01 * d20) / den
+        u = 1.0 - v - wgt
+        return (
+            u * zs[0] + wgt * zs[1] + v * zs[2],
+            u * us[0] + wgt * us[1] + v * us[2],
+            u * vs[0] + wgt * vs[1] + v * vs[2],
+        )
+    # Fallback: nearest corner (should be rare).
+    corners = ((p00, z00, u00, v00), (p10, z10, u10, v10), (p01, z01, u01, v01), (p11, z11, u11, v11))
+    best = min(corners, key=lambda t: float(np.linalg.norm(p - t[0])))
+    return best[1], best[2], best[3]
+
+
+def _collect_polygons(geom: BaseGeometry) -> list[Polygon2D]:
+    if geom.is_empty:
+        return []
+    gt = geom.geom_type
+    if gt == "Polygon":
+        return [geom]  # type: ignore[list-item]
+    if gt == "MultiPolygon":
+        return [g for g in geom.geoms if not g.is_empty]
+    if gt == "GeometryCollection":
+        out: list[Polygon2D] = []
+        for g in geom.geoms:
+            out.extend(_collect_polygons(g))
+        return out
+    return []
+
+
+def _append_clipped_quad_faces(
+    i: int,
+    j: int,
+    clip_poly: Polygon2D,
+    prepared_clip,
+    east: np.ndarray,
+    north: np.ndarray,
+    z: np.ndarray,
+    w: int,
+    h: int,
+    vid: np.ndarray,
+    vert_cache: dict[tuple[float, float], int],
+    verts: list[list[float]],
+    uvs: list[list[float]],
+    faces: list[list[int]],
+) -> bool:
+    """Triangulate ``quad ∩ clip_poly``; return True if any face was added."""
+    ring = [
+        (float(east[i, j]), float(north[i, j])),
+        (float(east[i + 1, j]), float(north[i + 1, j])),
+        (float(east[i + 1, j + 1]), float(north[i + 1, j + 1])),
+        (float(east[i, j + 1]), float(north[i, j + 1])),
+    ]
+    qfoot = Polygon2D(ring)
+    if not qfoot.is_valid:
+        qfoot = qfoot.buffer(0)
+    if qfoot.is_empty:
+        return False
+    if prepared_clip.contains(qfoot):
+        v00 = int(vid[i, j])
+        v10 = int(vid[i + 1, j])
+        v01 = int(vid[i, j + 1])
+        v11 = int(vid[i + 1, j + 1])
+        faces.append([v00, v10, v01])
+        faces.append([v10, v11, v01])
+        return True
+    inter = qfoot.intersection(clip_poly)
+    if inter.is_empty or inter.area <= 1e-12:
+        return False
+    corner_xy = ring
+    corner_vid = [int(vid[i, j]), int(vid[i + 1, j]), int(vid[i + 1, j + 1]), int(vid[i, j + 1])]
+    added = False
+
+    def resolve_vid(x: float, y: float) -> int:
+        for (cx, cy), cv in zip(corner_xy, corner_vid):
+            if abs(x - cx) <= _CORNER_TOL_M and abs(y - cy) <= _CORNER_TOL_M:
+                return cv
+        k = _xy_key(x, y)
+        if k in vert_cache:
+            return vert_cache[k]
+        zz, uu, vv = _height_uv_at_xy(x, y, i, j, east, north, z, w, h)
+        idx = len(verts)
+        vert_cache[k] = idx
+        verts.append([x, y, zz])
+        uvs.append([uu, vv])
+        return idx
+
+    for part in _collect_polygons(inter):
+        try:
+            t_verts, t_faces = trimesh.creation.triangulate_polygon(part)
+        except Exception:
+            continue
+        if len(t_verts) < 3 or len(t_faces) == 0:
+            continue
+        local_ids = [resolve_vid(float(p[0]), float(p[1])) for p in t_verts]
+        for tri in np.asarray(t_faces, dtype=np.int64):
+            faces.append([local_ids[int(tri[0])], local_ids[int(tri[1])], local_ids[int(tri[2])]])
+            added = True
+    return added
 
 
 def quad_inclusion_mask(
@@ -153,8 +387,8 @@ def build_mesh(
 
     ``prepare_z`` supplies elevation; it is stored on ``vertices[:,2]``. Matches trimesh / slicer XY bed + Z.
 
-    Quads are kept only if their ground footprint intersects ``poly_utm`` when given.
-    ``mask`` drives the texture alpha channel (RGBA).
+    Quads are kept if their footprint intersects ``poly_utm`` when given, otherwise if
+    any cell in the 2×2 block has ``mask >= 128``. ``mask`` also drives texture alpha.
     """
     h, w = dem.shape
     if texture_rgb.shape[0] != h or texture_rgb.shape[1] != w:
@@ -175,23 +409,47 @@ def build_mesh(
             v = 1.0 - (i + 0.5) / h
             uvs.append([u, v])
 
-    verts = np.asarray(verts, dtype=np.float64)
-    uvs = np.asarray(uvs, dtype=np.float64)
-    faces = []
+    verts_list: list[list[float]] = [list(v) for v in verts]
+    uvs_list: list[list[float]] = [list(u) for u in uvs]
+    faces: list[list[int]] = []
     vid = np.arange(h * w).reshape(h, w)
-    prepared_poly = prep(poly_utm) if poly_utm is not None else None
-    poly_bounds = poly_utm.bounds if poly_utm is not None else None
     east, north = _cell_center_east_north(transform, h, w)
-    for i in range(h - 1):
-        for j in range(w - 1):
-            if not _include_quad(i, j, east, north, prepared_poly, poly_bounds, mask):
-                continue
-            v00 = vid[i, j]
-            v10 = vid[i + 1, j]
-            v01 = vid[i, j + 1]
-            v11 = vid[i + 1, j + 1]
-            faces.append([v00, v10, v01])
-            faces.append([v10, v11, v01])
+    if poly_utm is not None:
+        prepared_clip = prep(poly_utm)
+        vert_cache: dict[tuple[float, float], int] = {}
+        for i in range(h - 1):
+            for j in range(w - 1):
+                _append_clipped_quad_faces(
+                    i,
+                    j,
+                    poly_utm,
+                    prepared_clip,
+                    east,
+                    north,
+                    z,
+                    w,
+                    h,
+                    vid,
+                    vert_cache,
+                    verts_list,
+                    uvs_list,
+                    faces,
+                )
+    else:
+        prepared_poly = None
+        poly_bounds = None
+        for i in range(h - 1):
+            for j in range(w - 1):
+                if not _include_quad(i, j, east, north, prepared_poly, poly_bounds, mask):
+                    continue
+                v00 = int(vid[i, j])
+                v10 = int(vid[i + 1, j])
+                v01 = int(vid[i, j + 1])
+                v11 = int(vid[i + 1, j + 1])
+                faces.append([v00, v10, v01])
+                faces.append([v10, v11, v01])
+    verts = np.asarray(verts_list, dtype=np.float64)
+    uvs = np.asarray(uvs_list, dtype=np.float64)
     faces = np.asarray(faces, dtype=np.int64)
 
     if mask is not None:
@@ -283,12 +541,39 @@ def _horizontal_extent_utm_m(surface: trimesh.Trimesh) -> float:
     return float(max(b[1, 0] - b[0, 0], b[1, 1] - b[0, 1]))
 
 
-def _meters_to_print_mm_scale(surface: trimesh.Trimesh, print_max_size_mm: float) -> float:
-    """Meters in scene → millimetre units so the terrain’s max horizontal (XY) span equals ``print_max_size_mm``."""
-    ext = _horizontal_extent_utm_m(surface)
-    if ext < 1e-9:
+def _surface_xy_bounds_m(surface: trimesh.Trimesh) -> tuple[float, float]:
+    """Axis-aligned horizontal spans (m) of ``surface`` in UTM east / north."""
+    b = surface.bounds
+    if b is None and len(surface.vertices) > 0:
+        v = np.asarray(surface.vertices, dtype=np.float64)
+        b = np.array([v.min(axis=0), v.max(axis=0)], dtype=np.float64)
+    if b is None:
+        return 0.0, 0.0
+    return float(b[1, 0] - b[0, 0]), float(b[1, 1] - b[0, 1])
+
+
+def _meters_to_print_mm_scale(
+    surface: trimesh.Trimesh,
+    print_max_size_mm: float,
+    *,
+    split_nx: int = 1,
+    split_nz: int = 1,
+) -> float:
+    """
+    UTM metres → millimetres so one **print bed** constraint is met:
+
+    - **1×1:** the terrain’s larger horizontal span equals ``print_max_size_mm`` (unchanged).
+    - **Nx×Nz puzzle:** each bbox tile’s larger horizontal span equals ``print_max_size_mm``
+      (uniform scale so tiles still mate). The full model is larger by ~max(Nx, Nz) in the
+      worst axis vs a single-bed fit.
+    """
+    dx, dy = _surface_xy_bounds_m(surface)
+    nxi = int(max(1, split_nx))
+    nzi = int(max(1, split_nz))
+    cell_long_m = max(dx / float(nxi), dy / float(nzi))
+    if cell_long_m < 1e-9:
         return 1.0
-    return float(print_max_size_mm) / ext
+    return float(print_max_size_mm) / cell_long_m
 
 
 def _close_heightfield_to_floor(
@@ -362,64 +647,20 @@ def _last_resort_voxel_fuse(
     """If multiple bodies remain, concat and voxelize; retry with finer voxels if needed."""
     out = solid
     vs = min(float(voxel_size_mm), max(0.15, float(print_max_size_mm) / 200.0))
-    # region agent log
-    _agent_debug_log(
-        hypothesis_id="C",
-        location="mesh.py:_last_resort_voxel_fuse:entry",
-        message="last_resort_start",
-        data={
-            "parts_in": len(list(solid.split(only_watertight=False))),
-            "vs0": round(vs, 6),
-            "print_max": float(print_max_size_mm),
-        },
-    )
-    # endregion
     for iter_i in range(4):
         parts = list(out.split(only_watertight=False))
         if len(parts) <= 1:
-            # region agent log
-            _agent_debug_log(
-                hypothesis_id="C",
-                location="mesh.py:_last_resort_voxel_fuse:exit_early",
-                message="last_resort_single",
-                data={"iter": iter_i, "parts": len(parts)},
-            )
-            # endregion
             return out
         union_try = _try_manifold_union(parts)
         if union_try is not None and len(union_try.split(only_watertight=False)) <= 1:
-            # region agent log
-            _agent_debug_log(
-                hypothesis_id="E",
-                location="mesh.py:_last_resort_voxel_fuse:manifold_union",
-                message="last_resort_union_ok",
-                data={"iter": iter_i},
-            )
-            # endregion
             return union_try
         merged = trimesh.util.concatenate(parts)
         merged = solid_process_for_export(merged)
         out = _voxel_merge_filled(merged, float(vs))
         n_after = len(out.split(only_watertight=False))
-        # region agent log
-        _agent_debug_log(
-            hypothesis_id="C",
-            location="mesh.py:_last_resort_voxel_fuse:iter",
-            message="last_resort_after_voxel",
-            data={"iter": iter_i, "vs": round(vs, 6), "parts_after": n_after},
-        )
-        # endregion
         if n_after <= 1:
             return out
         vs = max(0.1, vs * 0.5)
-    # region agent log
-    _agent_debug_log(
-        hypothesis_id="C",
-        location="mesh.py:_last_resort_voxel_fuse:exhausted",
-        message="last_resort_still_multi",
-        data={"parts_final": len(list(out.split(only_watertight=False)))},
-    )
-    # endregion
     return out
 
 
@@ -432,14 +673,6 @@ def _fuse_stacked_components(
     (no fragile XZ AABB intersection test), then voxel-merge into one body.
     """
     parts = list(solid.split(only_watertight=False))
-    # region agent log
-    _agent_debug_log(
-        hypothesis_id="B",
-        location="mesh.py:_fuse_stacked_components:entry",
-        message="fuse_entry",
-        data={"parts_in": len(parts), "vs": round(float(voxel_size_mm), 6)},
-    )
-    # endregion
     if len(parts) <= 1:
         return solid, False
     # Sort by bottom Z; stack so each part sits on the one below.
@@ -462,26 +695,10 @@ def _fuse_stacked_components(
     union_out = _try_manifold_union(parts)
     if union_out is not None:
         out = union_out
-        # region agent log
-        _agent_debug_log(
-            hypothesis_id="E",
-            location="mesh.py:_fuse_stacked_components:manifold_union",
-            message="fuse_manifold_union_ok",
-            data={"parts_out": len(list(out.split(only_watertight=False)))},
-        )
-        # endregion
         return out, True
     merged = trimesh.util.concatenate(parts)
     merged = solid_process_for_export(merged)
     out = _voxel_merge_filled(merged, float(voxel_size_mm))
-    # region agent log
-    _agent_debug_log(
-        hypothesis_id="B",
-        location="mesh.py:_fuse_stacked_components:after_voxel",
-        message="fuse_after_voxel_merge",
-        data={"parts_out": len(list(out.split(only_watertight=False)))},
-    )
-    # endregion
     return out, True
 
 
@@ -492,11 +709,16 @@ def build_print_solid(
     base_extrusion_mm: float = 1.0,
     center_on_bed: bool = True,
     voxel_size_mm: float | None = None,
+    print_split_nx: int = 1,
+    print_split_nz: int = 1,
 ) -> tuple[trimesh.Trimesh, dict[str, Any], trimesh.Trimesh]:
     """
     Build a **single closed print solid** in millimetres (**Z-up**: X east, Y north, Z elevation).
-    Build plate is **Z = 0**; terrain sits above a 1.0 mm base. Horizontal scale fits the longer
-    **XY** span to ``print_max_size_mm``. ``base_extrusion_mm`` is API-only; base thickness is 1 mm.
+    Build plate is **Z = 0**; terrain sits above a 1.0 mm base. Horizontal scale is isotropic:
+    with ``print_split_nx`` = ``print_split_nz`` = 1, the larger **whole-model** XY span matches
+    ``print_max_size_mm``. With an ``Nx``×``Nz`` puzzle grid, the larger **per-tile** XY span
+    (bounding box divided by the grid) matches ``print_max_size_mm`` so each STL can use the bed.
+    ``base_extrusion_mm`` is API-only; base thickness is 1 mm.
 
     Returns ``(solid, meta, surf_mm)`` where ``surf_mm`` is the scaled, centered open terrain (mm)
     with texture—used to paint the watertight solid for 3MF export.
@@ -505,7 +727,11 @@ def build_print_solid(
         poly_utm = poly_utm.buffer(0)
     if surface.is_empty or len(surface.vertices) == 0:
         raise ValueError("Cannot build print solid from empty surface mesh")
-    s = _meters_to_print_mm_scale(surface, print_max_size_mm)
+    spx = int(max(1, print_split_nx))
+    spz = int(max(1, print_split_nz))
+    s = _meters_to_print_mm_scale(
+        surface, print_max_size_mm, split_nx=spx, split_nz=spz
+    )
     # Fixed base thickness under variable fill layer.
     be = 1.0
     # Use the already-clipped mesh from build_mesh; additional centroid trimming can introduce
@@ -544,29 +770,8 @@ def build_print_solid(
         # Keep metadata stable when explicit voxel size is not in use.
         vs = max(0.25, float(print_max_size_mm) / 150.0)
     n_before_fuse = len(solid.split(only_watertight=False))
-    # region agent log
-    _agent_debug_log(
-        hypothesis_id="A",
-        location="mesh.py:build_print_solid:before_fuse",
-        message="pre_fuse_state",
-        data={
-            "n_before_fuse": n_before_fuse,
-            "vs": round(float(vs), 6),
-            "watertight": bool(solid.is_watertight),
-            "used_voxel_fallback": bool(not solid.is_watertight or abs(float(solid.volume)) <= 1e-9),
-        },
-    )
-    # endregion
     solid, _ = _fuse_stacked_components(solid, float(vs))
     n_after_fuse = len(solid.split(only_watertight=False))
-    # region agent log
-    _agent_debug_log(
-        hypothesis_id="B",
-        location="mesh.py:build_print_solid:after_fuse",
-        message="post_fuse_state",
-        data={"n_after_fuse": n_after_fuse},
-    )
-    # endregion
     last_resort = False
     if n_after_fuse > 1:
         solid = _last_resort_voxel_fuse(
@@ -578,34 +783,28 @@ def build_print_solid(
     if sb is not None and sb[0, 2] < 0:
         solid.apply_translation([0.0, 0.0, -float(sb[0, 2])])
     n_components = len(solid.split(only_watertight=False))
-    # region agent log
-    _agent_debug_log(
-        hypothesis_id="D",
-        location="mesh.py:build_print_solid:after_plate_snap",
-        message="final_components",
-        data={
-            "n_components_final": int(n_components),
-            "last_resort": last_resort,
-        },
-    )
-    # endregion
     sb2 = solid.bounds
     if sb2 is not None:
         d_mm = (float(sb2[1, 0] - sb2[0, 0]), float(sb2[1, 1] - sb2[0, 1]))
         w_max_mm = max(d_mm[0], d_mm[1])
     else:
         d_mm, w_max_mm = (0.0, 0.0), 0.0
-    ext0 = _horizontal_extent_utm_m(surface)
-    w_target = (float(ext0) * s) if ext0 > 0 else 0.0
+    puzzle = spx * spz > 1
     meta: dict[str, Any] = {
         "units": "mm",
         "z_up": True,
         "axes": "X=east_mm, Y=north_mm, Z=elevation_mm",
         "print_max_size_mm": float(print_max_size_mm),
+        "print_split_nx": int(spx),
+        "print_split_nz": int(spz),
+        "print_scale_for_puzzle_grid": bool(puzzle),
+        "print_per_tile_target_horizontal_mm": float(print_max_size_mm)
+        if puzzle
+        else None,
         "base_extrusion_mm": be,
         "scale_meters_to_print_mm": float(s),
         "print_voxel_size_mm": float(vs),
-        "print_xy_extent_max_mm": float(min(w_target, print_max_size_mm) if w_target > 0 else 0.0),
+        "print_xy_extent_max_mm": float(w_max_mm),
         "print_component_count": int(n_components),
         "print_solid_fused": bool(n_before_fuse > 1 or last_resort),
         "print_solid_last_resort_voxel": last_resort,
@@ -723,6 +922,239 @@ def export_3mf(solid: trimesh.Trimesh) -> bytes:
     return solid.export(file_type="3mf")
 
 
+# 3MF namespaces (Materials + Core; see 3MF Consortium materials extension samples).
+_M3MF_NS_CORE = "http://schemas.microsoft.com/3dmanufacturing/core/2015/02"
+_M3MF_NS_MAT = "http://schemas.microsoft.com/3dmanufacturing/material/2015/02"
+_M3MF_Q_CORE = f"{{{_M3MF_NS_CORE}}}"
+_M3MF_Q_MAT = f"{{{_M3MF_NS_MAT}}}"
+
+# Paths inside the 3MF package (OPC).
+TEXTURED_3MF_TEXTURE_PART = "3D/Textures/texture.png"
+TEXTURED_3MF_TEXTURE_PATH_ATTR = "/3D/Textures/texture.png"
+TEXTURED_3MF_MODEL_PART = "3D/3dmodel.model"
+
+
+def _texture_image_from_trimesh(m: trimesh.Trimesh) -> Image.Image:
+    """Resolve PIL image from ``TextureVisuals`` (direct or via material)."""
+    vis = m.visual
+    if vis is None or not getattr(vis, "defined", False):
+        raise ValueError("mesh has no visual")
+    img = getattr(vis, "image", None)
+    if img is None:
+        mat = getattr(vis, "material", None)
+        if mat is not None:
+            img = getattr(mat, "image", None)
+    if img is None:
+        raise ValueError("mesh has no texture image")
+    return img
+
+
+def mesh_has_texture_visual_for_3mf(m: trimesh.Trimesh) -> bool:
+    """True if ``m`` has UV + image suitable for textured 3MF export."""
+    vis = m.visual
+    if vis is None or not vis.defined:
+        return False
+    if getattr(vis, "kind", None) != "texture":
+        return False
+    uvs = getattr(vis, "uv", None)
+    if uvs is None:
+        return False
+    try:
+        uv_arr = np.asarray(uvs, dtype=np.float64)
+        if uv_arr.ndim != 2 or uv_arr.shape[1] != 2:
+            return False
+        if uv_arr.shape[0] != len(m.vertices):
+            return False
+        _texture_image_from_trimesh(m)
+    except Exception:
+        return False
+    return True
+
+
+def _fmt_coord(x: float) -> str:
+    return format(float(x), ".10g")
+
+
+def export_textured_print_3mf_zip(m: trimesh.Trimesh) -> bytes:
+    """
+    Write a 3MF package with embedded PNG and per-vertex UVs (3MF Materials extension).
+
+    Vertex and triangle indices follow 3MF consortium examples (0-based ``v1``/``p1``).
+    """
+    if m.is_empty or len(m.vertices) == 0 or len(m.faces) == 0:
+        raise ValueError("empty mesh")
+    v = np.asarray(m.vertices, dtype=np.float64)
+    f = np.asarray(m.faces, dtype=np.int64)
+    uv = np.asarray(m.visual.uv, dtype=np.float64)  # type: ignore[union-attr]
+    if uv.shape != (len(v), 2):
+        raise ValueError("UV count must match vertex count after finalize for textured 3MF")
+    img = _texture_image_from_trimesh(m)
+    png_io = io.BytesIO()
+    img.save(png_io, format="PNG")
+    png_bytes = png_io.getvalue()
+
+    texture2d_id = 1
+    texgroup_id = 2
+    object_id = 3
+
+    text = io.StringIO()
+    text.write('<?xml version="1.0" encoding="UTF-8"?>\n')
+    text.write(
+        "<model unit=\"millimeter\" xml:lang=\"en-US\" "
+        f'xmlns="{_M3MF_NS_CORE}" xmlns:m="{_M3MF_NS_MAT}">\n'
+    )
+    text.write("<resources>\n")
+    text.write(
+        f'<m:texture2d id="{texture2d_id}" path="{TEXTURED_3MF_TEXTURE_PATH_ATTR}" '
+        'contenttype="image/png" tilestyleu="wrap" tilestylev="wrap" />\n'
+    )
+    text.write(f'<m:texture2dgroup id="{texgroup_id}" texid="{texture2d_id}">\n')
+    for i in range(len(uv)):
+        u, wv = float(uv[i, 0]), float(uv[i, 1])
+        text.write(f'<m:tex2coord u="{_fmt_coord(u)}" v="{_fmt_coord(wv)}" />\n')
+    text.write("</m:texture2dgroup>\n")
+    text.write(f'<object id="{object_id}" type="model">\n<mesh>\n<vertices>\n')
+    for i in range(len(v)):
+        x, y, z = float(v[i, 0]), float(v[i, 1]), float(v[i, 2])
+        text.write(
+            f'<vertex x="{_fmt_coord(x)}" y="{_fmt_coord(y)}" z="{_fmt_coord(z)}" />\n'
+        )
+    text.write("</vertices>\n<triangles>\n")
+    for fi in range(len(f)):
+        a, b, c = int(f[fi, 0]), int(f[fi, 1]), int(f[fi, 2])
+        text.write(
+            f'<triangle v1="{a}" v2="{b}" v3="{c}" '
+            f'pid="{texgroup_id}" p1="{a}" p2="{b}" p3="{c}" />\n'
+        )
+    text.write(
+        "</triangles>\n</mesh>\n</object>\n</resources>\n"
+        "<build>\n"
+        f'<item objectid="{object_id}" transform="1 0 0 0 1 0 0 0 1 0 0 0" />\n'
+        "</build>\n</model>\n"
+    )
+    model_bytes = text.getvalue().encode("utf-8")
+
+    ct = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">\n'
+        '  <Default Extension="rels" '
+        'ContentType="application/vnd.openxmlformats-package.relationships+xml"/>\n'
+        '  <Default Extension="model" '
+        'ContentType="application/vnd.ms-package.3dmanufacturing-3dmodel+xml"/>\n'
+        '  <Default Extension="png" ContentType="image/png"/>\n'
+        "</Types>\n"
+    )
+    rels = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">\n'
+        '  <Relationship Type="http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel" '
+        f'Target="/{TEXTURED_3MF_MODEL_PART}" Id="rel0"/>\n'
+        "</Relationships>\n"
+    )
+
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("[Content_Types].xml", ct.encode("utf-8"))
+        zf.writestr("_rels/.rels", rels.encode("utf-8"))
+        zf.writestr(TEXTURED_3MF_MODEL_PART, model_bytes)
+        zf.writestr(TEXTURED_3MF_TEXTURE_PART, png_bytes)
+    return out.getvalue()
+
+
+def inspect_3mf_texture_payload(raw_3mf: bytes) -> dict[str, Any]:
+    """
+    Verify that a 3MF ZIP embeds a PNG and Materials texture markup.
+
+    Use this for job metadata: ``print_3mf_textured`` should reflect on-disk payload,
+    not only in-memory ``TextureVisuals``.
+    """
+    out: dict[str, Any] = {
+        "ok": False,
+        "texture_png_present": False,
+        "texture_path_zip": TEXTURED_3MF_TEXTURE_PART,
+        "texture_path_attr_expected": TEXTURED_3MF_TEXTURE_PATH_ATTR,
+        "texture_size_px": None,
+        "model_part": TEXTURED_3MF_MODEL_PART,
+        "model_has_texture2d": False,
+        "model_has_texture2dgroup": False,
+        "model_has_tex2coord": False,
+        "texture2d_count": 0,
+        "tex2coord_count": 0,
+        "triangle_count": 0,
+        "textured_triangle_count": 0,
+        "error": None,
+    }
+    zf: zipfile.ZipFile | None = None
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(raw_3mf), "r")
+    except zipfile.BadZipFile as e:
+        out["error"] = f"bad_zip: {e}"
+        return out
+    try:
+        if TEXTURED_3MF_TEXTURE_PART not in zf.namelist():
+            out["error"] = f"missing:{TEXTURED_3MF_TEXTURE_PART}"
+            return out
+        out["texture_png_present"] = True
+        with zf.open(TEXTURED_3MF_TEXTURE_PART) as fp:
+            im = Image.open(fp)
+            im.load()
+            out["texture_size_px"] = [int(im.width), int(im.height)]
+
+        if TEXTURED_3MF_MODEL_PART not in zf.namelist():
+            out["error"] = f"missing:{TEXTURED_3MF_MODEL_PART}"
+            return out
+        xml_data = zf.read(TEXTURED_3MF_MODEL_PART)
+        root = ET.fromstring(xml_data)
+
+        n_tex2d = 0
+        n_tex2coord = 0
+        n_tri = 0
+        n_tex_tri = 0
+        for el in root.iter():
+            tag = el.tag
+            if tag == _M3MF_Q_MAT + "texture2d":
+                n_tex2d += 1
+            elif tag == _M3MF_Q_MAT + "tex2coord":
+                n_tex2coord += 1
+            elif tag == _M3MF_Q_CORE + "triangle":
+                n_tri += 1
+                pid = el.get("pid")
+                if pid is not None and el.get("p1") is not None:
+                    p2 = el.get("p2")
+                    p3 = el.get("p3")
+                    if p2 is not None and p3 is not None:
+                        n_tex_tri += 1
+
+        out["model_has_texture2d"] = n_tex2d > 0
+        out["model_has_texture2dgroup"] = any(
+            el.tag == _M3MF_Q_MAT + "texture2dgroup" for el in root.iter()
+        )
+        out["model_has_tex2coord"] = n_tex2coord > 0
+        out["texture2d_count"] = n_tex2d
+        out["tex2coord_count"] = n_tex2coord
+        out["triangle_count"] = n_tri
+        out["textured_triangle_count"] = n_tex_tri
+
+        out["ok"] = bool(
+            out["texture_png_present"]
+            and out["model_has_texture2d"]
+            and out["model_has_texture2dgroup"]
+            and out["model_has_tex2coord"]
+            and n_tex_tri == n_tri
+            and n_tri > 0
+        )
+    except Exception as e:
+        out["error"] = f"inspect_failed: {e}"
+        out["ok"] = False
+    finally:
+        if zf is not None:
+            try:
+                zf.close()
+            except Exception:
+                pass
+    return out
+
+
 def orient_print_mesh_for_slicer(m: trimesh.Trimesh) -> trimesh.Trimesh:
     """Print mesh is already X east, Y north, Z elevation (mm); no axis permutation for slicers."""
     return m.copy()
@@ -735,6 +1167,8 @@ def export_print_stl(solid: trimesh.Trimesh) -> bytes:
 
 def export_print_3mf(solid: trimesh.Trimesh) -> bytes:
     m = finalize_mesh_for_3mf_export(orient_print_mesh_for_slicer(solid))
+    if mesh_has_texture_visual_for_3mf(m):
+        return export_textured_print_3mf_zip(m)
     return m.export(file_type="3mf")
 
 
@@ -746,6 +1180,7 @@ def split_solid_to_xz_grid(
     solid: trimesh.Trimesh,
     nx: int,
     nz: int,
+    export_basename: str = "terrain",
 ) -> list[dict[str, Any]]:
     """
     Split a closed mesh in **Z-up mm** (X east, Y north, Z elevation) into an ``nx``×``nz`` grid
@@ -755,6 +1190,7 @@ def split_solid_to_xz_grid(
     """
     nxi = int(max(1, nx))
     nzi = int(max(1, nz))
+    base = (export_basename or "terrain").strip() or "terrain"
     if solid.is_empty or len(solid.vertices) == 0:
         return []
     b = solid.bounds
@@ -805,7 +1241,7 @@ def split_solid_to_xz_grid(
                     "n_rows": nzi,
                     "index_of_total": k,
                     "total_pieces": total,
-                    "filename": f"terrain_print_r{iy + 1:02d}c{ix + 1:02d}.stl",
+                    "filename": f"{base}_print_r{iy + 1:02d}c{ix + 1:02d}.stl",
                     "mesh": part,
                 }
             )

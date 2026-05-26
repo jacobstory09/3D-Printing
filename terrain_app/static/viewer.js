@@ -29,6 +29,18 @@ function setStatus(msg) {
   statusEl.textContent = msg || "";
 }
 
+function exportDownloadName(meta, suffix) {
+  const base = meta.export_basename || "terrain";
+  return `${base}${suffix}`;
+}
+
+function setExportLink(anchor, href, downloadName) {
+  if (!anchor) return;
+  anchor.href = href;
+  if (downloadName) anchor.download = downloadName;
+  else anchor.removeAttribute("download");
+}
+
 function decodeBase64Float32(b64) {
   const bin = atob(b64);
   const buf = new ArrayBuffer(bin.length);
@@ -178,6 +190,7 @@ document.getElementById("run").addEventListener("click", async () => {
   fd.append("imagery", document.getElementById("imagery").value);
   fd.append("grid_size", document.getElementById("grid").value);
   fd.append("buffer_m", document.getElementById("buffer").value);
+  fd.append("boundary_smooth_m", document.getElementById("boundary-smooth").value);
   fd.append("vertical_exaggeration", document.getElementById("vex").value);
   fd.append("print_max_size_mm", document.getElementById("print-max").value);
   fd.append("print_base_extrusion_mm", document.getElementById("print-base").value);
@@ -236,55 +249,71 @@ document.getElementById("run").addEventListener("click", async () => {
     }
     const texUrl = rj.textures.rgba;
     await loadScene(meta, heights, texUrl, quadMask);
-    if (lnkGlb) lnkGlb.href = `/api/result/${jobId}/export.glb`;
-    if (lnkZip) lnkZip.href = `/api/result/${jobId}/export.zip`;
+    setExportLink(
+      lnkGlb,
+      `/api/result/${jobId}/export.glb`,
+      exportDownloadName(meta, ".glb")
+    );
+    setExportLink(
+      lnkZip,
+      `/api/result/${jobId}/export.zip`,
+      exportDownloadName(meta, "_obj.zip")
+    );
     if (meta.print && meta.print.ok) {
-      if (lnkStl) {
-        lnkStl.href = `/api/result/${jobId}/export.stl`;
-        lnkStl.removeAttribute("aria-disabled");
-      }
-      if (lnkPrintGlb) {
-        lnkPrintGlb.href = `/api/result/${jobId}/export_print.glb`;
-        lnkPrintGlb.removeAttribute("aria-disabled");
-      }
-      if (lnk3mf) {
-        lnk3mf.href = `/api/result/${jobId}/export.3mf`;
-        lnk3mf.removeAttribute("aria-disabled");
-      }
+      setExportLink(
+        lnkStl,
+        `/api/result/${jobId}/export.stl`,
+        exportDownloadName(meta, "_print.stl")
+      );
+      lnkStl?.removeAttribute("aria-disabled");
+      setExportLink(
+        lnkPrintGlb,
+        `/api/result/${jobId}/export_print.glb`,
+        exportDownloadName(meta, "_print.glb")
+      );
+      lnkPrintGlb?.removeAttribute("aria-disabled");
+      setExportLink(
+        lnk3mf,
+        `/api/result/${jobId}/export.3mf`,
+        exportDownloadName(meta, "_print.3mf")
+      );
+      lnk3mf?.removeAttribute("aria-disabled");
     } else {
-      if (lnkStl) {
-        lnkStl.href = "#";
-        lnkStl.setAttribute("aria-disabled", "true");
-      }
-      if (lnkPrintGlb) {
-        lnkPrintGlb.href = "#";
-        lnkPrintGlb.setAttribute("aria-disabled", "true");
-      }
-      if (lnk3mf) {
-        lnk3mf.href = "#";
-        lnk3mf.setAttribute("aria-disabled", "true");
-      }
+      setExportLink(lnkStl, "#", null);
+      lnkStl?.setAttribute("aria-disabled", "true");
+      setExportLink(lnkPrintGlb, "#", null);
+      lnkPrintGlb?.setAttribute("aria-disabled", "true");
+      setExportLink(lnk3mf, "#", null);
+      lnk3mf?.setAttribute("aria-disabled", "true");
     }
     const pz = meta.print && meta.print.pieces;
     if (pz && pz.ok && pz.count > 0) {
-      if (lnkPiecesZip) {
-        lnkPiecesZip.href = `/api/result/${jobId}/export_print_pieces.zip`;
-        lnkPiecesZip.removeAttribute("aria-disabled");
-      }
+      setExportLink(
+        lnkPiecesZip,
+        `/api/result/${jobId}/export_print_pieces.zip`,
+        exportDownloadName(meta, "_print_pieces.zip")
+      );
+      lnkPiecesZip?.removeAttribute("aria-disabled");
     } else {
-      if (lnkPiecesZip) {
-        lnkPiecesZip.href = "#";
-        lnkPiecesZip.setAttribute("aria-disabled", "true");
-      }
+      setExportLink(lnkPiecesZip, "#", null);
+      lnkPiecesZip?.setAttribute("aria-disabled", "true");
     }
     exportsEl.hidden = false;
     const splitDesc =
       meta.print && (meta.print.split_nx > 1 || meta.print.split_nz > 1)
-        ? `Puzzle: ${meta.print.split_nx}×${meta.print.split_nz} (each tile ≤ bed max)\n`
+        ? `Puzzle: ${meta.print.split_nx}×${meta.print.split_nz} (each tile scaled to ~print max mm on ground; monolithic STL is full assembly)\n`
         : "";
     const piecesLine =
       pz && pz.count > 0
-        ? `Puzzle STLs: ${pz.count} file(s), ~${pz.per_piece_size_mm ? Math.max(pz.per_piece_size_mm.x, pz.per_piece_size_mm.y ?? pz.per_piece_size_mm.z ?? 0).toFixed(1) : "?"} mm max on ground\n`
+        ? `Puzzle STLs: ${pz.count} file(s), ~${
+            pz.per_piece_size_mm
+              ? (
+                  pz.per_piece_size_mm.max_horizontal_mm_approx != null
+                    ? Number(pz.per_piece_size_mm.max_horizontal_mm_approx)
+                    : Math.max(pz.per_piece_size_mm.x, pz.per_piece_size_mm.y ?? 0)
+                ).toFixed(1)
+              : "?"
+          } mm max on ground per tile\n`
         : meta.print && (meta.print.split_nx > 1 || meta.print.split_nz > 1)
           ? `Puzzle STLs: none (split failed or empty)\n`
           : "";

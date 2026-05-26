@@ -8,7 +8,7 @@ from pathlib import Path
 import numpy as np
 from flask import Flask, Response, jsonify, render_template, request, send_file
 
-from terrain_app.pipeline import load_meta, process_kml
+from terrain_app.pipeline import export_download_filename, load_meta, process_kml
 
 
 def create_app() -> Flask:
@@ -41,15 +41,15 @@ def create_app() -> Flask:
         if imagery not in ("osm", "oam", "esri"):
             imagery = "osm"
         try:
-            grid_size = int(request.form.get("grid_size") or 512)
+            grid_size = int(request.form.get("grid_size") or 1024)
         except ValueError:
-            grid_size = 512
+            grid_size = 1024
         try:
             buffer_m = float(request.form.get("buffer_m") or 50)
         except ValueError:
             buffer_m = 50.0
         try:
-            vz = float(request.form.get("vertical_exaggeration") or 1)
+            vz = float(request.form.get("vertical_exaggeration") or 3)
         except ValueError:
             vz = 1.0
         vz = max(0.01, vz)
@@ -78,10 +78,18 @@ def create_app() -> Flask:
             split_nz = int(request.form.get("print_split_nz") or 1)
         except ValueError:
             split_nz = 1
+        bsm_raw = request.form.get("boundary_smooth_m")
+        boundary_smooth: float | None = None
+        if bsm_raw is not None and str(bsm_raw).strip().lower() not in ("", "auto"):
+            try:
+                boundary_smooth = float(bsm_raw)
+            except ValueError:
+                boundary_smooth = None
         try:
             job_id = process_kml(
                 data,
                 cache_root,
+                kml_filename=f.filename,
                 imagery=imagery,  # type: ignore[arg-type]
                 grid_size=grid_size,
                 buffer_m=buffer_m,
@@ -91,6 +99,7 @@ def create_app() -> Flask:
                 print_voxel_size_mm=print_voxel,
                 print_split_nx=split_nx,
                 print_split_nz=split_nz,
+                boundary_smooth_m=boundary_smooth,
             )
         except ValueError as e:
             return jsonify({"error": str(e)}), 400
@@ -158,7 +167,13 @@ def create_app() -> Flask:
         p = cache_root / job_id / "terrain.glb"
         if not p.is_file():
             return jsonify({"error": "Not found"}), 404
-        return send_file(p, mimetype="model/gltf-binary", as_attachment=True, download_name="terrain.glb")
+        meta = load_meta(cache_root, job_id)
+        return send_file(
+            p,
+            mimetype="model/gltf-binary",
+            as_attachment=True,
+            download_name=export_download_filename(meta, ".glb"),
+        )
 
     @app.get("/api/result/<job_id>/export.zip")
     def api_zip(job_id: str):
@@ -169,7 +184,7 @@ def create_app() -> Flask:
             p,
             mimetype="application/zip",
             as_attachment=True,
-            download_name="terrain_obj.zip",
+            download_name=export_download_filename(load_meta(cache_root, job_id), "_obj.zip"),
         )
 
     @app.get("/api/result/<job_id>/export.stl")
@@ -181,7 +196,7 @@ def create_app() -> Flask:
             p,
             mimetype="model/stl",
             as_attachment=True,
-            download_name="terrain_print.stl",
+            download_name=export_download_filename(load_meta(cache_root, job_id), "_print.stl"),
         )
 
     @app.get("/api/result/<job_id>/export_print.glb")
@@ -194,7 +209,7 @@ def create_app() -> Flask:
             p,
             mimetype="model/gltf-binary",
             as_attachment=True,
-            download_name="terrain_print.glb",
+            download_name=export_download_filename(load_meta(cache_root, job_id), "_print.glb"),
         )
 
     @app.get("/api/result/<job_id>/export.3mf")
@@ -206,7 +221,7 @@ def create_app() -> Flask:
             p,
             mimetype="model/3mf",
             as_attachment=True,
-            download_name="terrain_print.3mf",
+            download_name=export_download_filename(load_meta(cache_root, job_id), "_print.3mf"),
         )
 
     @app.get("/api/result/<job_id>/export_print_pieces.zip")
@@ -218,7 +233,9 @@ def create_app() -> Flask:
             p,
             mimetype="application/zip",
             as_attachment=True,
-            download_name="terrain_print_pieces.zip",
+            download_name=export_download_filename(
+                load_meta(cache_root, job_id), "_print_pieces.zip"
+            ),
         )
 
     return app

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import uuid
 from pathlib import Path
 from typing import Any, Dict, Literal
@@ -21,6 +22,28 @@ from terrain_app import mesh as mesh_mod
 
 ImageryKind = Literal["osm", "oam", "esri"]
 
+_EXPORT_BASENAME_MAX = 120
+
+
+def export_basename_from_kml_filename(filename: str | None) -> str:
+    """Safe stem from uploaded KML name for download filenames (not cache paths)."""
+    if filename is None or not str(filename).strip():
+        return "terrain"
+    stem = Path(str(filename)).stem.strip()
+    if not stem:
+        return "terrain"
+    safe = re.sub(r"[^\w.\-]+", "_", stem, flags=re.ASCII)
+    safe = safe.strip("._-")
+    if not safe:
+        return "terrain"
+    return safe[:_EXPORT_BASENAME_MAX]
+
+
+def export_download_filename(meta: Dict[str, Any], suffix: str) -> str:
+    """Build a download name from job meta, e.g. ``MyPark_print.stl``."""
+    base = str(meta.get("export_basename") or "terrain")
+    return f"{base}{suffix}"
+
 
 def _save_json(path: Path, data: Dict[str, Any]) -> None:
     path.write_text(json.dumps(data, indent=2), encoding="utf-8")
@@ -29,16 +52,18 @@ def _save_json(path: Path, data: Dict[str, Any]) -> None:
 def process_kml(
     kml_bytes: bytes,
     cache_root: Path,
+    kml_filename: str | None = None,
     imagery: ImageryKind = "osm",
-    grid_size: int = 512,
+    grid_size: int = 1024,
     buffer_m: float = 50.0,
-    vertical_exaggeration: float = 1.0,
+    vertical_exaggeration: float = 3.0,
     print_max_size_mm: float = 200.0,
     print_base_extrusion_mm: float = 1.0,
     print_center_on_bed: bool = True,
     print_voxel_size_mm: float | None = None,
     print_split_nx: int = 1,
     print_split_nz: int = 1,
+    boundary_smooth_m: float | None = None,
 ) -> str:
     grid_size = int(max(64, min(2048, grid_size)))
     poly_wgs = kml_mod.parse_kml_bytes(kml_bytes)
@@ -75,13 +100,14 @@ def process_kml(
             bbox4326, epsg, bounds_utm, dst_width, dst_height, session
         )
 
-    mask = rasterize(
-        [(poly_utm, 255)],
-        out_shape=dem.shape,
-        transform=dst_transform,
-        fill=0,
-        dtype=np.uint8,
-        all_touched=True,
+    mask, clip_poly_utm, smooth_m_used = mesh_mod.resolve_boundary_clipping(
+        poly_utm,
+        dem.shape,
+        dst_transform,
+        bounds_utm,
+        dst_width,
+        dst_height,
+        boundary_smooth_m,
     )
     texture_rgba = np.zeros((dem.shape[0], dem.shape[1], 4), dtype=np.uint8)
     texture_rgba[:, :, :3] = texture
@@ -96,14 +122,18 @@ def process_kml(
     Image.fromarray(texture_rgba, mode="RGBA").save(job_dir / "texture.png")
 
     t = dst_transform
+    export_base = export_basename_from_kml_filename(kml_filename)
     meta: Dict[str, Any] = {
         "job_id": job_id,
+        "kml_filename": str(kml_filename) if kml_filename else None,
+        "export_basename": export_base,
         "epsg": epsg,
         "bounds_utm": list(bounds_utm),
         "bbox4326": list(bbox4326),
         "grid_width": dst_width,
         "grid_height": dst_height,
         "buffer_m": buffer_m,
+        "boundary_smooth_m": smooth_m_used,
         "vertical_exaggeration": vertical_exaggeration,
         "imagery": imagery,
         "transform": [t.a, t.b, t.c, t.d, t.e, t.f],
@@ -121,7 +151,7 @@ def process_kml(
         vertical_exaggeration=vertical_exaggeration,
         z_offset_mode="min",
         mask=mask,
-        poly_utm=poly_utm,
+        poly_utm=clip_poly_utm,
     )
     mb = mesh.bounds
     if mb is not None:
@@ -143,7 +173,7 @@ def process_kml(
         meta["mesh_vertex_z_span_m"] = float(np.ptp(mv[:, 2]))
     if dem.shape[0] > 1 and dem.shape[1] > 1:
         qmask = mesh_mod.quad_inclusion_mask(
-            int(dem.shape[0]), int(dem.shape[1]), dst_transform, poly_utm, mask
+            int(dem.shape[0]), int(dem.shape[1]), dst_transform, clip_poly_utm, mask
         )
         (job_dir / "quad_mask.bin").write_bytes(np.ascontiguousarray(qmask).tobytes())
         meta["quad_mask"] = {"url": f"/api/result/{job_id}/quad_mask.bin"}
@@ -165,6 +195,8 @@ def process_kml(
             base_extrusion_mm=pbe,
             center_on_bed=print_center_on_bed,
             voxel_size_mm=print_voxel_size_mm,
+            print_split_nx=spx,
+            print_split_nz=spz,
         )
         pmb = print_mesh.bounds
         if pmb is not None:
@@ -174,7 +206,15 @@ def process_kml(
         mesh_3mf = mesh_mod.print_solid_with_satellite_uv(print_mesh, surf_mm)
         raw_3mf = mesh_mod.export_print_3mf(mesh_3mf)
         (job_dir / "terrain_print.3mf").write_bytes(raw_3mf)
-        print_info["print_3mf_textured"] = bool(
+        inspect_3mf = mesh_mod.inspect_3mf_texture_payload(raw_3mf)
+        print_info["print_3mf_texture_inspection"] = inspect_3mf
+        print_info["print_3mf_textured"] = bool(inspect_3mf.get("ok"))
+        print_info["print_3mf_texture_path_zip"] = (
+            inspect_3mf.get("texture_path_zip")
+            if inspect_3mf.get("texture_png_present")
+            else None
+        )
+        print_info["print_3mf_in_memory_texture"] = bool(
             mesh_3mf.visual is not None
             and mesh_3mf.visual.defined
             and getattr(mesh_3mf.visual, "kind", None) == "texture"
@@ -197,18 +237,23 @@ def process_kml(
         fy = float(fsm.get("y", 0) or fsm.get("z", 0) or 0) if isinstance(fsm, dict) else 0.0
         if spx * spz > 1 and fx > 0 and fy > 0:
             try:
-                pieces = mesh_mod.split_solid_to_xz_grid(print_mesh, spx, spz)
+                pieces = mesh_mod.split_solid_to_xz_grid(
+                    print_mesh, spx, spz, export_basename=export_base
+                )
                 if len(pieces) > 0:
                     (job_dir / "terrain_print_pieces.zip").write_bytes(
                         mesh_mod.export_print_pieces_stl_bytes(pieces)
                     )
+                cell_x = fx / float(spx) if spx > 0 else 0.0
+                cell_y = fy / float(spz) if spz > 0 else 0.0
                 print_info["pieces"] = {
                     "ok": bool(len(pieces) > 0),
                     "count": len(pieces),
                     "expected": spx * spz,
                     "per_piece_size_mm": {
-                        "x": fx / spx,
-                        "y": fy / spz,
+                        "x": cell_x,
+                        "y": cell_y,
+                        "max_horizontal_mm_approx": max(cell_x, cell_y),
                     },
                 }
             except Exception:

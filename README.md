@@ -36,6 +36,9 @@ Processed jobs are cached under `instance/cache/` (Flask’s auto-detected insta
 | GET | `/api/result/<id>/texture.png` | RGB texture |
 | GET | `/api/result/<id>/export.glb` | GLB with UV-mapped texture |
 | GET | `/api/result/<id>/export.zip` | OBJ + MTL + texture PNG |
+| GET | `/api/result/<id>/export.3mf` | Watertight **print** solid in 3MF; map texture embedded as `3D/Textures/texture.png` + UVs |
+| GET | `/api/result/<id>/export.stl` | Same print solid as STL |
+| GET | `/api/result/<id>/export_print.glb` | Same print solid as GLB (no satellite texture) |
 
 ### Export vs preview
 
@@ -49,11 +52,14 @@ Exports are built from the **same** `dem.npy`, transform, texture, `vertical_exa
 
 **KML clipping:** The web viewer triangulates the **same quads** as **exports (GLB + OBJ)**: only faces whose **UTM ground quad** intersects the KML polygon (Shapely). Texture **RGBA** still uses the raster mask for alpha. Large jobs (e.g. 1000×700+) may take longer while culling faces. Use **Alpha Clip** in Blender if needed for texture edges.
 
+**Print / slicing (`terrain_print.*`):** `terrain_print.3mf` is a normal 3MF ZIP: geometry in `3D/3dmodel.model`, imagery in **`3D/Textures/texture.png`**, aligned via the same UV mapping as the preview surface (nearest XY sample from the scaled terrain). In `meta.json`, **`print.print_3mf_textured`** is `true` only when an on-disk check (`print.print_3mf_texture_inspection`) confirms that PNG + texture markup are present—**not** when a website or slicer chooses to preview gray plastic. Many quoting UIs ignore diffuse textures; use Blender, a 3MF-capable viewer, or unzip the file to verify the map is inside the package.
+
 ## Notes
 
 - Large `grid_size` and wide areas increase USGS and tile download time.
 - OSM tile usage must follow [OSMF tile policy](https://operations.osmfoundation.org/policies/tiles/) (reasonable traffic, proper User-Agent).
 
 ## Known issues
-- Exported file is not clipped to KML boundaries like it is in the terrain viewer
 - Navigating in the terrain viewer is clunky. Click and drag to rotate works well, zoom in/out is broken
+
+**Boundary smoothing:** The **Boundary smooth** control offers **Auto** (~0.75× the DEM cell size in metres), or fixed **5 / 10 / 20** metre rounding. Mesh and print solids use a **smoothed polygon** and cut each DEM quad along that outline (not whole stair-step blocks). The texture uses a soft alpha fade at the edge. Finer **grid** resolution also reduces remaining edge faceting.

@@ -8,6 +8,8 @@ from typing import Any, Callable, Dict, List, Tuple
 import mercantile
 import numpy as np
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from PIL import Image
 import rasterio
 from rasterio.transform import from_bounds
@@ -293,4 +295,15 @@ def fetch_texture_oam(
 def make_session() -> requests.Session:
     s = requests.Session()
     s.headers.update({"User-Agent": UA})
+    retry = Retry(
+        total=5,
+        connect=5,
+        read=5,
+        backoff_factor=0.8,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset(["GET", "HEAD"]),
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
     return s
