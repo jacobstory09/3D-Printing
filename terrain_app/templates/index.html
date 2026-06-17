@@ -15,20 +15,25 @@
       --accent: #6ea8fe;
     }
     * { box-sizing: border-box; }
-    body {
+    html, body {
       margin: 0;
+      height: 100%;
+      overflow: hidden;
+    }
+    body {
       font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
       background: var(--bg);
       color: var(--text);
-      min-height: 100vh;
       display: grid;
       grid-template-columns: 320px 1fr;
+      height: 100vh;
     }
     aside {
       border-right: 1px solid var(--border);
       padding: 1.25rem;
       background: var(--panel);
-      overflow: auto;
+      overflow-y: auto;
+      max-height: 100vh;
     }
     h1 {
       font-size: 1.05rem;
@@ -94,46 +99,161 @@
       opacity: 0.45;
       pointer-events: none;
     }
+    .ams-colors {
+      margin-top: 0.75rem;
+      padding: 0.65rem;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--bg);
+      font-size: 0.75rem;
+    }
+    .ams-colors[hidden] { display: none; }
+    .ams-colors h3 {
+      margin: 0 0 0.5rem;
+      font-size: 0.72rem;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      color: var(--muted);
+      font-weight: 600;
+    }
+    .ams-color-row {
+      display: grid;
+      grid-template-columns: 18px 1fr auto;
+      gap: 0.45rem;
+      align-items: center;
+      margin-top: 0.35rem;
+    }
+    .ams-swatch {
+      width: 18px;
+      height: 18px;
+      border-radius: 4px;
+      border: 1px solid var(--border);
+    }
+    .ams-color-meta {
+      color: var(--muted);
+      font-size: 0.68rem;
+    }
     label.sub { margin-top: 0; font-size: 0.65rem; }
     .print-split-custom { display: none; grid-template-columns: 1fr 1fr; gap: 0.5rem; margin-top: 0.35rem; }
     .print-split-custom.is-visible { display: grid; }
+    .export-options {
+      margin-top: 0.5rem;
+      padding: 0.65rem;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--bg);
+    }
+    .export-options summary {
+      cursor: pointer;
+      font-size: 0.72rem;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      color: var(--muted);
+      font-weight: 600;
+    }
+    .export-check {
+      display: flex;
+      align-items: flex-start;
+      gap: 0.45rem;
+      margin-top: 0.45rem;
+      font-size: 0.78rem;
+      color: var(--text);
+      text-transform: none;
+      letter-spacing: normal;
+      cursor: pointer;
+    }
+    .export-check input { margin-top: 0.15rem; width: auto; }
     .status {
       margin-top: 0.75rem;
       font-size: 0.78rem;
       color: var(--muted);
       white-space: pre-wrap;
     }
+    .progress-wrap {
+      margin-top: 0.75rem;
+    }
+    .progress-wrap[hidden] {
+      display: none;
+    }
+    .progress-wrap progress {
+      width: 100%;
+      height: 0.45rem;
+      border: none;
+      border-radius: 4px;
+      overflow: hidden;
+      background: var(--bg);
+    }
+    .progress-wrap progress::-webkit-progress-bar {
+      background: var(--bg);
+    }
+    .progress-wrap progress::-webkit-progress-value {
+      background: var(--accent);
+    }
+    .progress-wrap progress::-moz-progress-bar {
+      background: var(--accent);
+    }
+    .progress-label {
+      margin-top: 0.35rem;
+      font-size: 0.78rem;
+      color: var(--muted);
+    }
     #viewport {
       position: relative;
-      min-height: 100vh;
+      height: 100vh;
+      overflow: hidden;
+      min-width: 0;
     }
     #viewport canvas {
       display: block;
-      width: 100%;
-      height: 100vh;
+      position: absolute;
+      top: 0;
+      left: 0;
+      touch-action: none;
+      cursor: grab;
+    }
+    #viewport canvas:active {
+      cursor: grabbing;
     }
     .hint {
       position: absolute;
       bottom: 12px;
       left: 12px;
+      right: 12px;
       font-size: 0.72rem;
       color: var(--muted);
       pointer-events: none;
+      line-height: 1.4;
+    }
+    .view-controls {
+      position: absolute;
+      top: 12px;
+      right: 12px;
+      display: flex;
+      gap: 0.4rem;
+      z-index: 2;
+    }
+    .view-controls button {
+      margin: 0;
+      width: auto;
+      padding: 0.35rem 0.65rem;
+      font-size: 0.75rem;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      background: rgba(23, 28, 38, 0.92);
+      color: var(--text);
+      font-weight: 500;
+      cursor: pointer;
+    }
+    .view-controls button:hover {
+      border-color: var(--accent);
+      color: var(--accent);
     }
   </style>
-  <script type="importmap">
-    {
-      "imports": {
-        "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
-        "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
-      }
-    }
-  </script>
 </head>
 <body>
   <aside>
     <h1>Terrain viewer</h1>
-    <p class="lead">KML boundary → USGS 3DEP + overhead imagery (UTM). Use satellite or ortho for trees, water, roofs. Drag to orbit · scroll to zoom.</p>
+    <p class="lead">KML boundary → USGS 3DEP + overhead imagery (UTM). Drag to orbit · scroll to zoom · right-drag to pan.</p>
     <label for="kml">KML file</label>
     <input id="kml" type="file" accept=".kml,.xml" />
     <label for="imagery">Imagery</label>
@@ -143,7 +263,7 @@
       <option value="osm">OpenStreetMap (carto, not aerial)</option>
     </select>
     <label for="grid">Grid size (max dimension)</label>
-    <input id="grid" type="number" min="64" max="2048" value="1024" />
+    <input id="grid" type="number" min="64" max="2048" value="512" />
     <label for="buffer">Buffer (m)</label>
     <input id="buffer" type="number" min="0" value="80" />
     <label for="boundary-smooth">Boundary smooth (m)</label>
@@ -155,6 +275,18 @@
     </select>
     <label for="vex">Vertical exaggeration</label>
     <input id="vex" type="number" min="0" step="0.5" value="3" title="Spinner steps by 0.5; values below 0.01 are clamped on build" />
+    <label for="pond-sensitivity">Pond / lake detection (AMS)</label>
+    <select id="pond-sensitivity" title="Conservative reduces false water on pasture; Aggressive finds more muddy lakes">
+      <option value="conservative" selected>Conservative</option>
+      <option value="balanced">Balanced</option>
+      <option value="aggressive">Aggressive</option>
+    </select>
+    <label for="ams-n-colors">AMS filament colors (max 8)</label>
+    <select id="ams-n-colors" title="Bambu AMS export uses at most 8 material regions">
+      <option value="4" selected>4</option>
+      <option value="6">6</option>
+      <option value="8">8</option>
+    </select>
     <label for="print-max">3D print max size (mm)</label>
     <input id="print-max" type="number" min="1" step="1" value="200" title="1×1: longer horizontal side of the model. Puzzle grid: each tile’s longer horizontal side (same scale across tiles)." />
     <label for="print-base">Base thickness (mm, fixed)</label>
@@ -179,21 +311,53 @@
         <input id="print-split-nz" type="number" min="1" max="12" value="1" />
       </div>
     </div>
+    <label for="ams-quality">AMS mesh quality</label>
+    <select id="ams-quality" title="Lower quality decimates the AMS OBJ for faster builds and smaller Bambu imports. STL stays full resolution.">
+      <option value="high">High (~400k faces max)</option>
+      <option value="medium" selected>Medium (~200k faces max)</option>
+      <option value="low">Low (~80k faces max)</option>
+    </select>
+    <details class="export-options" open>
+      <summary>Exports to build</summary>
+      <label class="export-check"><input type="checkbox" id="export-print-stl" checked /> Print STL (slicers)</label>
+      <label class="export-check"><input type="checkbox" id="export-print-ams" checked /> AMS OBJ ZIP (Bambu Studio)</label>
+      <label class="export-check"><input type="checkbox" id="export-preview-glb" /> Preview GLB (Blender)</label>
+      <label class="export-check"><input type="checkbox" id="export-preview-obj" /> Preview OBJ ZIP</label>
+      <label class="export-check"><input type="checkbox" id="export-print-3mf" /> Print 3MF</label>
+      <label class="export-check"><input type="checkbox" id="export-print-textured-glb" /> Print textured GLB</label>
+      <label class="export-check"><input type="checkbox" id="export-print-ams-glb" /> AMS preview GLB</label>
+      <label class="export-check"><input type="checkbox" id="export-print-pieces" /> Puzzle STLs ZIP</label>
+      <label class="export-check"><input type="checkbox" id="export-quad-mask" /> Quad mask overlay</label>
+    </details>
     <button id="run" type="button">Build scene</button>
+    <div class="progress-wrap" id="progress-wrap" hidden>
+      <progress id="progress-bar" max="100" value="0"></progress>
+      <div class="progress-label" id="progress-label">Starting…</div>
+    </div>
     <div class="status" id="status"></div>
     <div class="exports" id="exports" hidden>
-      <strong>Export</strong>
-      <a id="lnk-glb" href="#" download>terrain.glb (textured surface — no print base)</a>
-      <a id="lnk-zip" href="#" download>terrain_obj.zip (same surface + texture)</a>
-      <a id="lnk-stl" href="#" download>terrain_print.stl (Z-up, XY bed)</a>
-      <a id="lnk-print-glb" href="#" download>terrain_print.glb (Z-up, same solid)</a>
-      <a id="lnk-3mf" href="#" download>terrain_print.3mf (Z-up, color-capable)</a>
+      <strong>Preview (no print base)</strong>
+      <a id="lnk-glb" href="#" download>terrain.glb (textured surface)</a>
+      <a id="lnk-zip" href="#" download>terrain_obj.zip (same + OBJ)</a>
+      <strong>Print solid (base + walls, Z-up mm)</strong>
+      <a id="lnk-stl" href="#" download>terrain_print.stl (geometry only — for slicers)</a>
+      <a id="lnk-print-textured-glb" href="#" download>terrain_print_textured.glb (full satellite color)</a>
+      <a id="lnk-print-ams-glb" href="#" download>terrain_print_ams.glb (AMS color regions)</a>
+      <a id="lnk-3mf" href="#" download>terrain_print.3mf (geometry only — slicers)</a>
+      <a id="lnk-ams-color" href="#" download>terrain_print_ams_obj.zip (AMS — Bambu Studio)</a>
       <a id="lnk-pieces-zip" href="#" download>terrain_print_pieces.zip (puzzle STLs)</a>
+      <div class="ams-colors" id="ams-colors" hidden>
+        <h3>Recommended AMS filaments</h3>
+        <div id="ams-color-list"></div>
+      </div>
     </div>
   </aside>
   <div id="viewport">
-    <div class="hint">Preview and exports share one frame: X east, Y north, Z elevation (m). WebGL uses Z-up (camera up); print STLs are the same axes in mm (XY bed, Z height). terrain.glb is centered in XY. Satellite: Esri, Maxar, Earthstar, GIS community. OSM © contributors. OAM = dataset license.</div>
+    <div class="view-controls">
+      <button type="button" id="view-reset" title="Fit map to viewport">Fit view</button>
+    </div>
+    <div class="hint">Drag to pan · Scroll to zoom. Top-down satellite map (X east, Y north).</div>
   </div>
-  <script type="module" src="{{ url_for('static', filename='viewer.js') }}"></script>
+  <script src="{{ url_for('static', filename='viewer.js') }}"></script>
 </body>
 </html>

@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import io
+import logging
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Callable, Dict, List, Tuple
 
 import mercantile
@@ -13,11 +17,17 @@ from urllib3.util.retry import Retry
 from PIL import Image
 import rasterio
 from rasterio.transform import from_bounds
-from rasterio.warp import Resampling, reproject
+from rasterio.warp import Resampling
+
+from terrain_app.dem import reproject_array
 from shapely.geometry import box as shapely_box
 from shapely.geometry import shape
 
 UA = "terrain-viewer/1.0 (local flask; contact: local)"
+TILE_DOWNLOAD_WORKERS = 8
+
+_log = logging.getLogger("terrain_app.imagery")
+_thread_local = threading.local()
 
 ESRI_WORLD_IMAGERY = (
     "https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
@@ -30,6 +40,14 @@ def pick_zoom(minx: float, miny: float, maxx: float, maxy: float, max_tiles: int
         if len(tiles) <= max_tiles:
             return z
     return 9
+
+
+def _thread_session() -> requests.Session:
+    s = getattr(_thread_local, "session", None)
+    if s is None:
+        s = make_session()
+        _thread_local.session = s
+    return s
 
 
 def _download_tile(session: requests.Session, url: str) -> np.ndarray:
@@ -45,6 +63,7 @@ def mosaic_xyz_to_mercator(
     url_fn: Callable[[mercantile.Tile], str],
     session: requests.Session,
 ) -> Tuple[np.ndarray, Tuple[float, float, float, float]]:
+    del session  # thread-local sessions used for parallel downloads
     xs = [t.x for t in tiles]
     ys = [t.y for t in tiles]
     min_tx, max_tx = min(xs), max(xs)
@@ -57,11 +76,26 @@ def mosaic_xyz_to_mercator(
     _, B1, R1, _ = mercantile.xy_bounds(mercantile.Tile(max_tx, max_ty, z))
     west, south, east, north = L0, B1, R1, N0
 
-    for t in tiles:
-        arr = _download_tile(session, url_fn(t))
+    def _fetch_one(t: mercantile.Tile) -> tuple[int, int, np.ndarray]:
+        arr = _download_tile(_thread_session(), url_fn(t))
         i = (t.x - min_tx) * 256
         j = (t.y - min_ty) * 256
-        canvas[j : j + 256, i : i + 256, :] = arr
+        return j, i, arr
+
+    t0 = time.perf_counter()
+    workers = min(TILE_DOWNLOAD_WORKERS, max(1, len(tiles)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(_fetch_one, t) for t in tiles]
+        for fut in as_completed(futures):
+            j, i, arr = fut.result()
+            canvas[j : j + 256, i : i + 256, :] = arr
+    _log.debug(
+        "mosaic tiles=%d zoom=%d workers=%d duration_s=%.3f",
+        len(tiles),
+        z,
+        workers,
+        time.perf_counter() - t0,
+    )
 
     return canvas, (west, south, east, north)
 
@@ -80,15 +114,18 @@ def warp_rgb_to_utm(
     dst_west, dst_south, dst_east, dst_north = dst_bounds
     transform_dst = from_bounds(dst_west, dst_south, dst_east, dst_north, dst_width, dst_height)
     out = np.zeros((dst_height, dst_width, 3), dtype=np.uint8)
+    dst_crs = f"EPSG:{dst_epsg}"
     for b in range(3):
-        reproject(
-            source=rgb[:, :, b],
-            destination=out[:, :, b],
-            src_transform=transform_src,
-            src_crs="EPSG:3857",
-            dst_transform=transform_dst,
-            dst_crs=f"EPSG:{dst_epsg}",
+        out[:, :, b] = reproject_array(
+            rgb[:, :, b],
+            transform_src,
+            "EPSG:3857",
+            dst_width,
+            dst_height,
+            transform_dst,
+            dst_crs,
             resampling=Resampling.bilinear,
+            dst_dtype=np.uint8,
         )
     return out
 
@@ -168,6 +205,7 @@ def warp_https_geotiff_rgb_to_utm(
     dst_west, dst_south, dst_east, dst_north = dst_bounds
     dst_transform = from_bounds(dst_west, dst_south, dst_east, dst_north, dst_width, dst_height)
     out = np.zeros((dst_height, dst_width, 3), dtype=np.uint8)
+    dst_crs = f"EPSG:{dst_epsg}"
     try:
         with rasterio.Env(GDAL_HTTP_USERAGENT=UA, GDAL_DISABLE_READDIR_ON_OPEN="EMPTY_DIR"):
             with rasterio.open(vsi) as src:
@@ -176,18 +214,18 @@ def warp_https_geotiff_rgb_to_utm(
                 n = min(3, int(src.count))
                 if n < 1:
                     return None
-                tmp = np.zeros((dst_height, dst_width), dtype=np.float32)
                 for k in range(3):
                     bi = min(k + 1, n)
-                    tmp.fill(0)
-                    reproject(
-                        source=rasterio.band(src, bi),
-                        destination=tmp,
-                        src_transform=src.transform,
-                        src_crs=src.crs,
-                        dst_transform=dst_transform,
-                        dst_crs=f"EPSG:{dst_epsg}",
+                    tmp = reproject_array(
+                        src.read(bi),
+                        src.transform,
+                        src.crs,
+                        dst_width,
+                        dst_height,
+                        dst_transform,
+                        dst_crs,
                         resampling=Resampling.bilinear,
+                        dst_dtype=np.float32,
                     )
                     tmp = np.nan_to_num(tmp, nan=0.0, posinf=0.0, neginf=0.0)
                     dt = src.dtypes[bi - 1]

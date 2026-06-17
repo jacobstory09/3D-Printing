@@ -7,6 +7,7 @@ import zipfile
 
 import numpy as np
 import rasterio.transform
+import trimesh
 from rasterio.features import rasterize
 from shapely.geometry import box
 
@@ -117,6 +118,12 @@ class TestPrintSolid(unittest.TestCase):
                     whole_quad_faces += 2
         self.assertLess(len(mesh.faces), whole_quad_faces)
 
+    def test_build_print_solid_raises_on_empty_surface(self) -> None:
+        empty = trimesh.Trimesh()
+        poly = box(0, 0, 10, 10)
+        with self.assertRaises(ValueError):
+            mesh_mod.build_print_solid(empty, poly, center_on_bed=True)
+
     def test_single_component_and_plate(self) -> None:
         mesh, poly = _synthetic_terrain(20, 20)
         solid, meta, surf_mm = mesh_mod.build_print_solid(
@@ -193,28 +200,33 @@ class TestPrintSolid(unittest.TestCase):
         )
         textured = mesh_mod.print_solid_with_satellite_uv(solid, surf)
         self.assertTrue(mesh_mod.mesh_has_texture_visual_for_3mf(textured))
-        raw = mesh_mod.export_print_3mf(textured)
+        raw = mesh_mod.export_textured_print_3mf(textured)
         ins = mesh_mod.inspect_3mf_texture_payload(raw)
         self.assertTrue(ins.get("ok"), msg=str(ins))
         zf = zipfile.ZipFile(io.BytesIO(raw), "r")
         try:
             self.assertIn(mesh_mod.TEXTURED_3MF_TEXTURE_PART, zf.namelist())
+            self.assertIn(mesh_mod.TEXTURED_3MF_MODEL_RELS_PART, zf.namelist())
         finally:
             zf.close()
         self.assertEqual(ins.get("textured_triangle_count"), ins.get("triangle_count"))
         self.assertGreater(int(ins.get("tex2coord_count") or 0), 10)
 
-    def test_3mf_untextured_falls_back_to_trimesh_geometry(self) -> None:
+    def test_3mf_slicer_export_is_geometry_only(self) -> None:
         mesh, poly = _synthetic_terrain(12, 12)
-        solid, _meta, _surf = mesh_mod.build_print_solid(
+        solid, _meta, surf = mesh_mod.build_print_solid(
             mesh, poly, print_max_size_mm=100.0, center_on_bed=True, voxel_size_mm=None
         )
-        self.assertFalse(mesh_mod.mesh_has_texture_visual_for_3mf(solid))
+        textured = mesh_mod.print_solid_with_satellite_uv(solid, surf)
         raw = mesh_mod.export_print_3mf(solid)
         ins = mesh_mod.inspect_3mf_texture_payload(raw)
         self.assertFalse(ins.get("ok"))
         reloaded = mesh_mod.mesh_from_3mf_bytes(raw)
         self.assertGreater(len(reloaded.faces), 0)
+        textured_ins = mesh_mod.inspect_3mf_texture_payload(
+            mesh_mod.export_textured_print_3mf(textured)
+        )
+        self.assertTrue(textured_ins.get("ok"))
 
     def test_3mf_roundtrip_has_no_non_manifold_edges(self) -> None:
         mesh, poly = _synthetic_terrain(14, 14)
@@ -224,9 +236,46 @@ class TestPrintSolid(unittest.TestCase):
         textured = mesh_mod.print_solid_with_satellite_uv(solid, surf)
         self.assertTrue(textured.visual.defined)
         self.assertEqual(getattr(textured.visual, "kind", None), "texture")
-        raw = mesh_mod.export_print_3mf(textured)
+        raw = mesh_mod.export_print_3mf(solid)
         reloaded = mesh_mod.mesh_from_3mf_bytes(raw)
         self.assertEqual(mesh_mod.non_manifold_edge_count(reloaded), 0)
+
+    def test_textured_print_glb_embeds_png(self) -> None:
+        import json
+        import struct
+
+        mesh, poly = _synthetic_terrain(14, 14)
+        solid, _meta, surf = mesh_mod.build_print_solid(
+            mesh, poly, print_max_size_mm=110.0, center_on_bed=True, voxel_size_mm=None
+        )
+        textured = mesh_mod.print_solid_with_satellite_uv(solid, surf)
+        raw = mesh_mod.export_textured_print_glb(textured)
+        json_len, _ = struct.unpack_from("<I4s", raw, 12)
+        tree = json.loads(raw[20 : 20 + json_len].decode("utf-8").rstrip("\x20"))
+        bin_len = struct.unpack_from("<I4s", raw, 20 + json_len)[0]
+        bin_start = 20 + json_len + 8
+        bin_chunk = raw[bin_start : bin_start + bin_len]
+        self.assertEqual(len(tree.get("images", [])), 1)
+        self.assertIn("TEXCOORD_0", tree["meshes"][0]["primitives"][0]["attributes"])
+        self.assertTrue(b"\x89PNG" in bin_chunk)
+
+    def test_ams_print_glb_exports_scene(self) -> None:
+        import json
+        import struct
+
+        mesh, poly = _synthetic_terrain(14, 14)
+        solid, _meta, surf = mesh_mod.build_print_solid(
+            mesh, poly, print_max_size_mm=110.0, center_on_bed=True, voxel_size_mm=None
+        )
+        parts = [
+            ({"rgb": [200, 40, 30], "part_name": "color_a"}, solid),
+            ({"rgb": [30, 120, 200], "part_name": "color_b"}, solid),
+        ]
+        raw = mesh_mod.export_ams_print_glb(parts)
+        json_len, _ = struct.unpack_from("<I4s", raw, 12)
+        tree = json.loads(raw[20 : 20 + json_len].decode("utf-8").rstrip("\x20"))
+        self.assertGreaterEqual(len(tree.get("meshes", [])), 1)
+        self.assertGreater(len(raw), 500)
 
 
 class TestExportBasename(unittest.TestCase):

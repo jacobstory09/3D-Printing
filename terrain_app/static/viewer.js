@@ -1,21 +1,156 @@
-import * as THREE from "three";
-import { OrbitControls } from "three/addons/controls/OrbitControls.js";
-
 const statusEl = document.getElementById("status");
+const progressWrap = document.getElementById("progress-wrap");
+const progressBar = document.getElementById("progress-bar");
+const progressLabel = document.getElementById("progress-label");
 const exportsEl = document.getElementById("exports");
 const lnkGlb = document.getElementById("lnk-glb");
 const lnkZip = document.getElementById("lnk-zip");
 const lnkStl = document.getElementById("lnk-stl");
-const lnkPrintGlb = document.getElementById("lnk-print-glb");
+const lnkPrintTexturedGlb = document.getElementById("lnk-print-textured-glb");
+const lnkPrintAmsGlb = document.getElementById("lnk-print-ams-glb");
 const lnk3mf = document.getElementById("lnk-3mf");
+const lnkAmsColor = document.getElementById("lnk-ams-color");
 const lnkPiecesZip = document.getElementById("lnk-pieces-zip");
+const amsColorsEl = document.getElementById("ams-colors");
+const amsColorListEl = document.getElementById("ams-color-list");
 const viewport = document.getElementById("viewport");
 
-let renderer;
-let scene;
-let camera;
-let controls;
-let meshGroup;
+let canvas;
+let ctx;
+let resizeObserver;
+/** Loaded RGBA satellite image (alpha = KML footprint). */
+let mapImage = null;
+/** Screen-space pan/zoom: image drawn at (offsetX, offsetY) with uniform scale. */
+let view = { scale: 1, offsetX: 0, offsetY: 0 };
+let drag = null;
+
+function initCanvas() {
+  if (canvas) return;
+  canvas = document.createElement("canvas");
+  canvas.setAttribute("aria-label", "Property map preview");
+  viewport.appendChild(canvas);
+  ctx = canvas.getContext("2d");
+  canvas.addEventListener("pointerdown", onPointerDown);
+  canvas.addEventListener("pointermove", onPointerMove);
+  canvas.addEventListener("pointerup", onPointerUp);
+  canvas.addEventListener("pointercancel", onPointerUp);
+  canvas.addEventListener("wheel", onWheel, { passive: false });
+  resizeObserver = new ResizeObserver(onResize);
+  resizeObserver.observe(viewport);
+  window.addEventListener("resize", onResize);
+  onResize();
+}
+
+function loadImage(url) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = () => reject(new Error("Failed to load map image"));
+    img.src = url;
+  });
+}
+
+function viewportSize() {
+  return {
+    w: Math.max(viewport.clientWidth, 1),
+    h: Math.max(viewport.clientHeight, 1),
+  };
+}
+
+function fitView() {
+  if (!mapImage) return;
+  const { w, h } = viewportSize();
+  const pad = 0.04;
+  const scaleX = (w * (1 - 2 * pad)) / mapImage.width;
+  const scaleY = (h * (1 - 2 * pad)) / mapImage.height;
+  view.scale = Math.min(scaleX, scaleY);
+  view.offsetX = (w - mapImage.width * view.scale) / 2;
+  view.offsetY = (h - mapImage.height * view.scale) / 2;
+  draw();
+}
+
+function draw() {
+  if (!ctx || !canvas) return;
+  const { w, h } = viewportSize();
+  ctx.clearRect(0, 0, w, h);
+  ctx.fillStyle = "#0f1218";
+  ctx.fillRect(0, 0, w, h);
+  if (!mapImage) return;
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = "high";
+  ctx.drawImage(
+    mapImage,
+    view.offsetX,
+    view.offsetY,
+    mapImage.width * view.scale,
+    mapImage.height * view.scale
+  );
+}
+
+function onResize() {
+  if (!canvas || !viewport) return;
+  const { w, h } = viewportSize();
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  canvas.width = Math.round(w * dpr);
+  canvas.height = Math.round(h * dpr);
+  canvas.style.width = `${w}px`;
+  canvas.style.height = `${h}px`;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  if (mapImage) {
+    const cx = w / 2;
+    const cy = h / 2;
+    const wx = (cx - view.offsetX) / view.scale;
+    const wy = (cy - view.offsetY) / view.scale;
+    view.offsetX = cx - wx * view.scale;
+    view.offsetY = cy - wy * view.scale;
+  }
+  draw();
+}
+
+function zoomAt(factor, sx, sy) {
+  const wx = (sx - view.offsetX) / view.scale;
+  const wy = (sy - view.offsetY) / view.scale;
+  view.scale = Math.min(Math.max(view.scale * factor, 0.02), 200);
+  view.offsetX = sx - wx * view.scale;
+  view.offsetY = sy - wy * view.scale;
+  draw();
+}
+
+function onWheel(ev) {
+  ev.preventDefault();
+  const rect = canvas.getBoundingClientRect();
+  const sx = ev.clientX - rect.left;
+  const sy = ev.clientY - rect.top;
+  const factor = ev.deltaY < 0 ? 1.12 : 1 / 1.12;
+  zoomAt(factor, sx, sy);
+}
+
+function onPointerDown(ev) {
+  if (ev.button !== 0) return;
+  canvas.setPointerCapture(ev.pointerId);
+  canvas.style.cursor = "grabbing";
+  drag = { x: ev.clientX, y: ev.clientY, ox: view.offsetX, oy: view.offsetY };
+}
+
+function onPointerMove(ev) {
+  if (!drag) return;
+  view.offsetX = drag.ox + (ev.clientX - drag.x);
+  view.offsetY = drag.oy + (ev.clientY - drag.y);
+  draw();
+}
+
+function onPointerUp(ev) {
+  if (!drag) return;
+  canvas.releasePointerCapture(ev.pointerId);
+  canvas.style.cursor = "grab";
+  drag = null;
+}
+
+async function loadMapPreview(textureUrl) {
+  initCanvas();
+  mapImage = await loadImage(textureUrl);
+  fitView();
+}
 
 document.getElementById("print-split-preset")?.addEventListener("change", (ev) => {
   const wrap = document.getElementById("print-split-custom");
@@ -29,9 +164,114 @@ function setStatus(msg) {
   statusEl.textContent = msg || "";
 }
 
+function setProgress(message, percent) {
+  if (!progressWrap || !progressBar || !progressLabel) return;
+  progressWrap.hidden = false;
+  const pct = Math.max(0, Math.min(100, Number(percent) || 0));
+  progressBar.value = pct;
+  progressLabel.textContent = pct > 0 ? `${message} (${pct}%)` : message;
+}
+
+function hideProgress() {
+  if (progressWrap) progressWrap.hidden = true;
+}
+
+async function readJson(resp) {
+  const text = await resp.text();
+  if (!text.trim()) {
+    throw new Error(
+      resp.ok
+        ? "Server returned an empty response (is the dev server still running?)"
+        : `Request failed (${resp.status} ${resp.statusText})`
+    );
+  }
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new Error(`Invalid JSON from server (${resp.status})`);
+  }
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function waitForJob(jobId) {
+  let emptyRetries = 0;
+  while (true) {
+    let r;
+    try {
+      r = await fetch(`/api/process/${jobId}/progress`);
+    } catch {
+      throw new Error("Lost connection to server while waiting for the job");
+    }
+    let p;
+    try {
+      p = await readJson(r);
+      emptyRetries = 0;
+    } catch (err) {
+      // Dev-server reload or a race while progress.json is being written.
+      if (emptyRetries < 8 && /empty response|Invalid JSON/i.test(String(err.message))) {
+        emptyRetries += 1;
+        await sleep(500);
+        continue;
+      }
+      throw err;
+    }
+    if (!r.ok) {
+      if (r.status === 404) throw new Error("Job expired or was removed from the server");
+      throw new Error(p.error || r.statusText);
+    }
+    setProgress(p.message || "Working…", p.percent);
+    if (p.status === "done") return jobId;
+    if (p.status === "error") throw new Error(p.error || p.message || "Processing failed");
+    await sleep(1000);
+  }
+}
+
 function exportDownloadName(meta, suffix) {
   const base = meta.export_basename || "terrain";
   return `${base}${suffix}`;
+}
+
+function exportBuilt(meta, key) {
+  const built = meta.exports && meta.exports.built;
+  if (built && Object.prototype.hasOwnProperty.call(built, key)) {
+    return Boolean(built[key]);
+  }
+  if (key === "preview_glb" || key === "preview_obj") return false;
+  if (key === "print_stl" || key === "print_ams") {
+    return Boolean(meta.print && meta.print.ok);
+  }
+  if (key === "print_textured_glb") return Boolean(meta.print && meta.print.print_textured_glb);
+  if (key === "print_ams_glb") {
+    const ams = meta.print && meta.print.ams;
+    return Boolean(ams && ams.print_ams_glb);
+  }
+  if (key === "print_3mf") return Boolean(meta.print && meta.print.ok);
+  if (key === "print_pieces") {
+    const pz = meta.print && meta.print.pieces;
+    return Boolean(pz && pz.ok && pz.count > 0);
+  }
+  return false;
+}
+
+function appendExportFlags(fd) {
+  const pairs = [
+    ["export_preview_glb", "export-preview-glb"],
+    ["export_preview_obj", "export-preview-obj"],
+    ["export_quad_mask", "export-quad-mask"],
+    ["export_print_stl", "export-print-stl"],
+    ["export_print_3mf", "export-print-3mf"],
+    ["export_print_textured_glb", "export-print-textured-glb"],
+    ["export_print_ams", "export-print-ams"],
+    ["export_print_ams_glb", "export-print-ams-glb"],
+    ["export_print_pieces", "export-print-pieces"],
+  ];
+  for (const [name, id] of pairs) {
+    const el = document.getElementById(id);
+    if (el && el.checked) fd.append(name, "1");
+  }
 }
 
 function setExportLink(anchor, href, downloadName) {
@@ -41,142 +281,35 @@ function setExportLink(anchor, href, downloadName) {
   else anchor.removeAttribute("download");
 }
 
-function decodeBase64Float32(b64) {
-  const bin = atob(b64);
-  const buf = new ArrayBuffer(bin.length);
-  const u8 = new Uint8Array(buf);
-  for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
-  return new Float32Array(buf);
-}
-
-async function fetchHeights(url) {
-  const r = await fetch(url);
-  if (!r.ok) throw new Error("Failed to load heights");
-  const ab = await r.arrayBuffer();
-  return new Float32Array(ab);
-}
-
-function buildGeometry(meta, heights, quadMask) {
-  const w = meta.grid_width;
-  const h = meta.grid_height;
-  const [a, b, c, d, e, f] = meta.transform;
-  if (heights.length !== w * h) {
-    throw new Error(`Height count ${heights.length} != ${w * h}`);
+function renderAmsColors(ams) {
+  if (!amsColorListEl || !amsColorsEl) return;
+  if (!ams || !ams.ok || !Array.isArray(ams.colors) || ams.colors.length === 0) {
+    amsColorsEl.hidden = true;
+    amsColorListEl.innerHTML = "";
+    return;
   }
-  const pos = new Float32Array(w * h * 3);
-  const uv = new Float32Array(w * h * 2);
-  let p = 0;
-  let t = 0;
-  for (let i = 0; i < h; i++) {
-    for (let j = 0; j < w; j++) {
-      const x = a * j + b * i + c;
-      const y = d * j + e * i + f;
-      const z = heights[i * w + j];
-      pos[p++] = x;
-      pos[p++] = y;
-      pos[p++] = z;
-      uv[t++] = (j + 0.5) / w;
-      uv[t++] = 1.0 - (i + 0.5) / h;
-    }
+  amsColorListEl.innerHTML = "";
+  for (const c of ams.colors) {
+    const row = document.createElement("div");
+    row.className = "ams-color-row";
+    const swatch = document.createElement("span");
+    swatch.className = "ams-swatch";
+    swatch.style.background = c.hex || "#888";
+    swatch.title = c.hex || "";
+    const label = document.createElement("div");
+    label.innerHTML = `<strong>${c.name || c.part_name || "Color"}</strong><div class="ams-color-meta">${c.part_name || ""} · ${c.hex || ""} · ${c.coverage_pct != null ? `${c.coverage_pct}%` : ""}</div>`;
+    const tris = document.createElement("div");
+    tris.className = "ams-color-meta";
+    tris.textContent = c.triangle_count != null ? `${c.triangle_count} tris` : "";
+    row.appendChild(swatch);
+    row.appendChild(label);
+    row.appendChild(tris);
+    amsColorListEl.appendChild(row);
   }
-  const idx = [];
-  const vid = (i, j) => i * w + j;
-  const qmw = w - 1;
-  for (let i = 0; i < h - 1; i++) {
-    for (let j = 0; j < w - 1; j++) {
-      if (quadMask && !quadMask[i * qmw + j]) continue;
-      const v00 = vid(i, j);
-      const v10 = vid(i + 1, j);
-      const v01 = vid(i, j + 1);
-      const v11 = vid(i + 1, j + 1);
-      idx.push(v00, v10, v01, v10, v11, v01);
-    }
-  }
-  const geo = new THREE.BufferGeometry();
-  geo.setAttribute("position", new THREE.BufferAttribute(pos, 3));
-  geo.setAttribute("uv", new THREE.BufferAttribute(uv, 2));
-  geo.setIndex(idx);
-  geo.computeVertexNormals();
-  return geo;
+  amsColorsEl.hidden = false;
 }
 
-function initThree() {
-  if (renderer) return;
-  scene = new THREE.Scene();
-  scene.background = new THREE.Color(0x0f1218);
-  camera = new THREE.PerspectiveCamera(50, 1, 0.5, 1e9);
-  camera.up.set(0, 0, 1);
-  renderer = new THREE.WebGLRenderer({ antialias: true });
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-  viewport.appendChild(renderer.domElement);
-  controls = new OrbitControls(camera, renderer.domElement);
-  controls.enableDamping = true;
-  const amb = new THREE.AmbientLight(0xffffff, 0.55);
-  scene.add(amb);
-  const dir = new THREE.DirectionalLight(0xffffff, 0.85);
-  dir.position.set(1, 1, 2);
-  scene.add(dir);
-  meshGroup = new THREE.Group();
-  scene.add(meshGroup);
-  window.addEventListener("resize", onResize);
-  onResize();
-  animate();
-}
-
-function onResize() {
-  if (!renderer) return;
-  const w = viewport.clientWidth;
-  const h = viewport.clientHeight;
-  camera.aspect = w / Math.max(h, 1);
-  camera.updateProjectionMatrix();
-  renderer.setSize(w, h);
-}
-
-function animate() {
-  requestAnimationFrame(animate);
-  if (!renderer) return;
-  controls.update();
-  renderer.render(scene, camera);
-}
-
-function clearMesh() {
-  if (!meshGroup) return;
-  while (meshGroup.children.length) {
-    const o = meshGroup.children.pop();
-    if (o.geometry) o.geometry.dispose();
-    if (o.material) {
-      if (o.material.map) o.material.map.dispose();
-      o.material.dispose();
-    }
-  }
-}
-
-async function loadScene(meta, heights, textureUrl, quadMask) {
-  initThree();
-  clearMesh();
-  const geo = buildGeometry(meta, heights, quadMask);
-  const tex = await new THREE.TextureLoader().loadAsync(textureUrl);
-  tex.colorSpace = THREE.SRGBColorSpace;
-  tex.flipY = false;
-  tex.anisotropy = renderer.capabilities.getMaxAnisotropy();
-  const mat = new THREE.MeshStandardMaterial({
-    map: tex,
-    transparent: true,
-    alphaTest: 0.05,
-    metalness: 0.05,
-    roughness: 0.85,
-    side: THREE.DoubleSide,
-  });
-  const mesh = new THREE.Mesh(geo, mat);
-  meshGroup.add(mesh);
-  geo.computeBoundingSphere();
-  const bs = geo.boundingSphere;
-  const center = bs.center.clone();
-  const r = Math.max(bs.radius, 50);
-  camera.position.set(center.x + r * 1.1, center.y + r * 1.1, center.z + r * 0.45);
-  controls.target.copy(center);
-  controls.update();
-}
+document.getElementById("view-reset")?.addEventListener("click", fitView);
 
 document.getElementById("run").addEventListener("click", async () => {
   const fileInput = document.getElementById("kml");
@@ -192,6 +325,10 @@ document.getElementById("run").addEventListener("click", async () => {
   fd.append("buffer_m", document.getElementById("buffer").value);
   fd.append("boundary_smooth_m", document.getElementById("boundary-smooth").value);
   fd.append("vertical_exaggeration", document.getElementById("vex").value);
+  fd.append("pond_sensitivity", document.getElementById("pond-sensitivity").value);
+  fd.append("ams_n_colors", document.getElementById("ams-n-colors").value);
+  fd.append("ams_quality", document.getElementById("ams-quality").value);
+  appendExportFlags(fd);
   fd.append("print_max_size_mm", document.getElementById("print-max").value);
   fd.append("print_base_extrusion_mm", document.getElementById("print-base").value);
   const voxIn = document.getElementById("print-voxel").value.trim();
@@ -217,77 +354,122 @@ document.getElementById("run").addEventListener("click", async () => {
   }
   fd.append("print_split_nx", String(spx));
   fd.append("print_split_nz", String(spz));
-  setStatus("Fetching 3DEP and imagery…");
+  setStatus("");
+  setProgress("Uploading…", 0);
   exportsEl.hidden = true;
   document.getElementById("run").disabled = true;
   try {
     const pr = await fetch("/api/process", { method: "POST", body: fd });
-    const pj = await pr.json();
+    const pj = await readJson(pr);
     if (!pr.ok) throw new Error(pj.error || pr.statusText);
-    const jobId = pj.meta.job_id;
+    const jobId = pj.job_id;
+    if (!jobId) throw new Error("No job id returned");
+    await waitForJob(jobId);
+    hideProgress();
     const rr = await fetch(`/api/result/${jobId}`);
-    const rj = await rr.json();
+    const rj = await readJson(rr);
     if (!rr.ok) throw new Error(rj.error || rr.statusText);
     const meta = rj.meta;
-    let heights;
-    if (rj.heights_inline_base64) {
-      heights = decodeBase64Float32(rj.heights_inline_base64);
+    const jobBuilt = (key) => exportBuilt(meta, key);
+    await loadMapPreview(rj.textures.rgba);
+    if (jobBuilt("preview_glb")) {
+      setExportLink(
+        lnkGlb,
+        `/api/result/${jobId}/export.glb`,
+        exportDownloadName(meta, ".glb")
+      );
+      lnkGlb?.removeAttribute("aria-disabled");
     } else {
-      heights = await fetchHeights(rj.heights.url);
+      setExportLink(lnkGlb, "#", null);
+      lnkGlb?.setAttribute("aria-disabled", "true");
     }
-    let quadMask = null;
-    const qm = meta.quad_mask && meta.quad_mask.url;
-    if (qm) {
-      const qr = await fetch(qm);
-      if (qr.ok) {
-        const buf = new Uint8Array(await qr.arrayBuffer());
-        const gw = meta.grid_width;
-        const gh = meta.grid_height;
-        const expected = (gw - 1) * (gh - 1);
-        if (buf.length === expected) quadMask = buf;
-      }
+    if (jobBuilt("preview_obj")) {
+      setExportLink(
+        lnkZip,
+        `/api/result/${jobId}/export.zip`,
+        exportDownloadName(meta, "_obj.zip")
+      );
+      lnkZip?.removeAttribute("aria-disabled");
+    } else {
+      setExportLink(lnkZip, "#", null);
+      lnkZip?.setAttribute("aria-disabled", "true");
     }
-    const texUrl = rj.textures.rgba;
-    await loadScene(meta, heights, texUrl, quadMask);
-    setExportLink(
-      lnkGlb,
-      `/api/result/${jobId}/export.glb`,
-      exportDownloadName(meta, ".glb")
-    );
-    setExportLink(
-      lnkZip,
-      `/api/result/${jobId}/export.zip`,
-      exportDownloadName(meta, "_obj.zip")
-    );
     if (meta.print && meta.print.ok) {
-      setExportLink(
-        lnkStl,
-        `/api/result/${jobId}/export.stl`,
-        exportDownloadName(meta, "_print.stl")
-      );
-      lnkStl?.removeAttribute("aria-disabled");
-      setExportLink(
-        lnkPrintGlb,
-        `/api/result/${jobId}/export_print.glb`,
-        exportDownloadName(meta, "_print.glb")
-      );
-      lnkPrintGlb?.removeAttribute("aria-disabled");
-      setExportLink(
-        lnk3mf,
-        `/api/result/${jobId}/export.3mf`,
-        exportDownloadName(meta, "_print.3mf")
-      );
-      lnk3mf?.removeAttribute("aria-disabled");
+      if (jobBuilt("print_stl")) {
+        setExportLink(
+          lnkStl,
+          `/api/result/${jobId}/export.stl`,
+          exportDownloadName(meta, "_print.stl")
+        );
+        lnkStl?.removeAttribute("aria-disabled");
+      } else {
+        setExportLink(lnkStl, "#", null);
+        lnkStl?.setAttribute("aria-disabled", "true");
+      }
+      if (jobBuilt("print_textured_glb")) {
+        setExportLink(
+          lnkPrintTexturedGlb,
+          `/api/result/${jobId}/export_print_textured.glb`,
+          exportDownloadName(meta, "_print_textured.glb")
+        );
+        lnkPrintTexturedGlb?.removeAttribute("aria-disabled");
+      } else {
+        setExportLink(lnkPrintTexturedGlb, "#", null);
+        lnkPrintTexturedGlb?.setAttribute("aria-disabled", "true");
+      }
+      if (jobBuilt("print_3mf")) {
+        setExportLink(
+          lnk3mf,
+          `/api/result/${jobId}/export.3mf`,
+          exportDownloadName(meta, "_print.3mf")
+        );
+        lnk3mf?.removeAttribute("aria-disabled");
+      } else {
+        setExportLink(lnk3mf, "#", null);
+        lnk3mf?.setAttribute("aria-disabled", "true");
+      }
+      const ams = meta.print && meta.print.ams;
+      if (jobBuilt("print_ams") && ams && ams.ok) {
+        const amsSuffix = ams.download_suffix || "_print_ams_obj.zip";
+        setExportLink(
+          lnkAmsColor,
+          `/api/result/${jobId}/export_print_ams`,
+          exportDownloadName(meta, amsSuffix)
+        );
+        lnkAmsColor?.removeAttribute("aria-disabled");
+        renderAmsColors(ams);
+      } else {
+        setExportLink(lnkAmsColor, "#", null);
+        lnkAmsColor?.setAttribute("aria-disabled", "true");
+        if (ams && ams.ok) renderAmsColors(ams);
+        else renderAmsColors(null);
+      }
+      if (jobBuilt("print_ams_glb") && ams && ams.print_ams_glb) {
+        setExportLink(
+          lnkPrintAmsGlb,
+          `/api/result/${jobId}/export_print_ams.glb`,
+          exportDownloadName(meta, "_print_ams.glb")
+        );
+        lnkPrintAmsGlb?.removeAttribute("aria-disabled");
+      } else {
+        setExportLink(lnkPrintAmsGlb, "#", null);
+        lnkPrintAmsGlb?.setAttribute("aria-disabled", "true");
+      }
     } else {
       setExportLink(lnkStl, "#", null);
       lnkStl?.setAttribute("aria-disabled", "true");
-      setExportLink(lnkPrintGlb, "#", null);
-      lnkPrintGlb?.setAttribute("aria-disabled", "true");
+      setExportLink(lnkPrintTexturedGlb, "#", null);
+      lnkPrintTexturedGlb?.setAttribute("aria-disabled", "true");
+      setExportLink(lnkPrintAmsGlb, "#", null);
+      lnkPrintAmsGlb?.setAttribute("aria-disabled", "true");
       setExportLink(lnk3mf, "#", null);
       lnk3mf?.setAttribute("aria-disabled", "true");
+      setExportLink(lnkAmsColor, "#", null);
+      lnkAmsColor?.setAttribute("aria-disabled", "true");
+      renderAmsColors(null);
     }
     const pz = meta.print && meta.print.pieces;
-    if (pz && pz.ok && pz.count > 0) {
+    if (jobBuilt("print_pieces") && pz && pz.ok && pz.count > 0) {
       setExportLink(
         lnkPiecesZip,
         `/api/result/${jobId}/export_print_pieces.zip`,
@@ -382,6 +564,7 @@ document.getElementById("run").addEventListener("click", async () => {
     );
   } catch (e) {
     console.error(e);
+    hideProgress();
     setStatus(String(e.message || e));
   } finally {
     document.getElementById("run").disabled = false;

@@ -29,3 +29,26 @@ def project_polygon(poly_wgs84: Polygon, epsg: int) -> Polygon:
 def buffer_bounds_utm(poly_utm: Polygon, buffer_m: float) -> tuple[float, float, float, float]:
     b = poly_utm.buffer(buffer_m).bounds
     return float(b[0]), float(b[1]), float(b[2]), float(b[3])
+
+
+def grid_dimensions_from_bounds(
+    bounds_utm: tuple[float, float, float, float],
+    max_dimension: int,
+) -> tuple[int, int]:
+    """
+    Raster width/height (pixels) with ``max(width, height) <= max_dimension``.
+
+    ``max_dimension`` is the UI "grid size" — longest side of the output grid.
+    """
+    cap = int(max(64, min(2048, max_dimension)))
+    west, south, east, north = bounds_utm
+    width_m = max(float(east - west), 1e-9)
+    height_m = max(float(north - south), 1e-9)
+    aspect = height_m / width_m
+    if aspect >= 1.0:
+        dst_height = cap
+        dst_width = max(64, int(round(cap / aspect)))
+    else:
+        dst_width = cap
+        dst_height = max(64, int(round(cap * aspect)))
+    return dst_width, dst_height
