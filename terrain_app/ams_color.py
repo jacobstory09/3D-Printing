@@ -596,6 +596,20 @@ def _palette_entries_from_rgb(
     return entries
 
 
+def _resolve_pond_mask(
+    texture_rgba: np.ndarray,
+    dem: np.ndarray | None,
+    *,
+    pond_sensitivity: str | None,
+    pond_mask: np.ndarray | None,
+) -> np.ndarray:
+    if pond_mask is not None:
+        arr = np.asarray(texture_rgba, dtype=np.uint8)
+        h, w = int(arr.shape[0]), int(arr.shape[1])
+        return np.asarray(pond_mask, dtype=bool).reshape(h, w)
+    return detect_pond_mask(texture_rgba, dem=dem, sensitivity=pond_sensitivity)
+
+
 def recommend_ams_palette(
     texture_rgba: np.ndarray,
     n_colors: int = 4,
@@ -603,6 +617,7 @@ def recommend_ams_palette(
     reserve_base: bool = True,
     dem: np.ndarray | None = None,
     pond_sensitivity: str | None = "conservative",
+    pond_mask: np.ndarray | None = None,
 ) -> list[dict[str, Any]]:
     """
     Cluster masked satellite RGB into ``n_colors`` filament recommendations.
@@ -626,8 +641,11 @@ def recommend_ams_palette(
     if pixels.size == 0:
         pixels = rgb.reshape(-1, 3)
 
+    pond_mask_override = pond_mask is not None
     if not reserve_base:
-        pond_mask = detect_pond_mask(arr, dem=dem, sensitivity=pond_sensitivity)
+        pond_mask = _resolve_pond_mask(
+            arr, dem, pond_sensitivity=pond_sensitivity, pond_mask=pond_mask
+        )
         pond_count = int(np.count_nonzero(pond_mask & mask))
         reserve_pond = pond_count >= POND_MIN_PIXELS and n >= 2
         if reserve_pond:
@@ -644,13 +662,18 @@ def recommend_ams_palette(
                     ent["pond_pixel_count"] = pond_count
                     ent["imagery_rgb"] = list(map(int, pond_imagery))
                     ent["filament_rgb"] = list(POND_FILAMENT_RGB)
+                    if pond_mask_override:
+                        ent["rgb"] = list(POND_FILAMENT_RGB)
+                        ent["hex"] = _hex_rgb(POND_FILAMENT_RGB)
             return entries
         pal_flat = _mediancut_palette_rgb(pixels, n)
         return _palette_entries_from_rgb(pal_flat, pixels)
 
     top_n = n - 1
     base_rgb = _predominant_rgb(pixels)
-    pond_mask = detect_pond_mask(arr, dem=dem, sensitivity=pond_sensitivity)
+    pond_mask = _resolve_pond_mask(
+        arr, dem, pond_sensitivity=pond_sensitivity, pond_mask=pond_mask
+    )
     pond_count = int(np.count_nonzero(pond_mask & mask))
     reserve_pond = pond_count >= POND_MIN_PIXELS and top_n >= 2
 
@@ -677,6 +700,9 @@ def recommend_ams_palette(
                 ent["pond_pixel_count"] = pond_count
                 ent["imagery_rgb"] = list(map(int, pond_imagery))
                 ent["filament_rgb"] = list(POND_FILAMENT_RGB)
+                if pond_mask_override:
+                    ent["rgb"] = list(POND_FILAMENT_RGB)
+                    ent["hex"] = _hex_rgb(POND_FILAMENT_RGB)
                 foot = float(np.count_nonzero(mask))
                 if foot > 0:
                     ent["coverage_pct"] = round(100.0 * float(pond_count) / foot, 2)
@@ -920,6 +946,7 @@ def build_ams_labels(
     mesh_uv: trimesh.Trimesh | None = None,
     dem: np.ndarray | None = None,
     pond_sensitivity: str | None = "conservative",
+    pond_mask: np.ndarray | None = None,
     voxel_size_mm: float | None = None,
     on_progress: Callable[[str], None] | None = None,
 ) -> tuple[list[dict[str, Any]], np.ndarray, np.ndarray]:
@@ -936,16 +963,23 @@ def build_ams_labels(
         footprint = np.ones(arr.shape[:2], dtype=bool)
     if on_progress:
         on_progress("Detecting water and building color palette…")
-    pond_mask = detect_pond_mask(arr, dem=dem, sensitivity=pond_sensitivity)
+    resolved_pond_mask = _resolve_pond_mask(
+        arr, dem, pond_sensitivity=pond_sensitivity, pond_mask=pond_mask
+    )
     palette = recommend_ams_palette(
-        texture_rgba, n_colors=n_colors, reserve_base=True, dem=dem, pond_sensitivity=pond_sensitivity
+        texture_rgba,
+        n_colors=n_colors,
+        reserve_base=True,
+        dem=dem,
+        pond_sensitivity=pond_sensitivity,
+        pond_mask=pond_mask if pond_mask is not None else None,
     )
     base_index = next(int(p["index"]) for p in palette if p.get("role") == "base")
     palette_rgb = np.array([p["rgb"] for p in palette], dtype=np.uint8)
     force_pond: tuple[int, np.ndarray] | None = None
     pond_entry = next((p for p in palette if p.get("role") == "pond"), None)
-    if pond_entry is not None and pond_mask.any():
-        force_pond = (int(pond_entry["index"]), pond_mask)
+    if pond_entry is not None and resolved_pond_mask.any():
+        force_pond = (int(pond_entry["index"]), resolved_pond_mask)
     index_image = quantize_texture_index_image(
         texture_rgba,
         palette_rgb,

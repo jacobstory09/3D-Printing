@@ -814,6 +814,10 @@ def build_print_solid(
 
     Returns ``(solid, meta, surf_mm)`` where ``surf_mm`` is the scaled, centered open terrain (mm)
     with texture—used to paint the watertight solid for 3MF export.
+
+    ``poly_utm`` must be the same clip polygon passed to :func:`build_mesh` (from
+    :func:`resolve_boundary_clipping`), not the raw KML outline when boundary smoothing is on.
+    The surface mesh is closed as-is; this polygon is not used to re-clip geometry.
     """
     if not poly_utm.is_valid:
         poly_utm = poly_utm.buffer(0)
@@ -950,8 +954,15 @@ def mesh_from_3mf_bytes(data: bytes) -> trimesh.Trimesh:
 def print_solid_with_satellite_uv(
     print_solid: trimesh.Trimesh,
     surf_mm: trimesh.Trimesh,
+    *,
+    texture_image: Image.Image | None = None,
 ) -> trimesh.Trimesh:
-    """Attach satellite texture UVs to the print solid by nearest-neighbor in XY to ``surf_mm``."""
+    """Attach satellite texture UVs to the print solid by nearest-neighbor in XY to ``surf_mm``.
+
+    UVs are always transferred when ``surf_mm`` has them. A material image is optional
+    (needed for textured exports, not for AMS face labeling). After ``print_cache.glb``
+    reload, ``surf_mm`` often retains UVs but loses the embedded PNG.
+    """
     out = print_solid.copy()
     vis = surf_mm.visual
     if vis is None or not vis.defined or getattr(vis, "kind", None) != "texture":
@@ -964,14 +975,17 @@ def print_solid_with_satellite_uv(
         return out
     mat = getattr(vis, "material", None)
     img = getattr(mat, "image", None) if mat is not None else None
-    if img is None:
-        return out
+    if img is None and texture_image is not None:
+        img = texture_image
     tree = cKDTree(np.asarray(surf_mm.vertices[:, :2], dtype=np.float64))
     q = np.asarray(out.vertices[:, :2], dtype=np.float64)
     _, idx = tree.query(q, k=1)
     idx_i = np.asarray(idx, dtype=np.intp)
     new_uv = uv_arr[idx_i]
-    out.visual = trimesh.visual.TextureVisuals(uv=new_uv, image=img.copy())
+    if img is not None:
+        out.visual = trimesh.visual.TextureVisuals(uv=new_uv, image=img.copy())
+    else:
+        out.visual = trimesh.visual.TextureVisuals(uv=new_uv)
     return out
 
 
@@ -1519,6 +1533,14 @@ def export_bambu_ams_obj_zip(
     return buf.read()
 
 
+def _meta_mtl_rgb(meta: dict[str, Any]) -> tuple[int, int, int]:
+    if meta.get("role") == "pond" and meta.get("filament_rgb"):
+        fr = meta["filament_rgb"]
+        return (int(fr[0]), int(fr[1]), int(fr[2]))
+    rgb = meta["rgb"]
+    return (int(rgb[0]), int(rgb[1]), int(rgb[2]))
+
+
 def export_bambu_ams_obj_zip_labeled(
     solid: trimesh.Trimesh,
     face_labels: np.ndarray,
@@ -1553,7 +1575,7 @@ def export_bambu_ams_obj_zip_labeled(
         if face_idx.size == 0:
             continue
         mat = str(meta.get("material_name") or meta.get("part_name") or "color")
-        r, g, b = _rgb_to_mtl_components(meta["rgb"])
+        r, g, b = _rgb_to_mtl_components(_meta_mtl_rgb(meta))
         mtl_lines.append(f"newmtl {mat}\n")
         mtl_lines.append(f"Kd {r:.6f} {g:.6f} {b:.6f}\n")
         mtl_lines.append(f"Ka {r:.6f} {g:.6f} {b:.6f}\n")
@@ -1712,6 +1734,7 @@ def export_bambu_ams_color_package(
     mesh_uv: trimesh.Trimesh | None = None,
     dem: np.ndarray | None = None,
     pond_sensitivity: str | None = "conservative",
+    pond_mask: np.ndarray | None = None,
     voxel_size_mm: float | None = None,
     ams_quality: str = "medium",
     on_progress: Callable[[str], None] | None = None,
@@ -1739,6 +1762,7 @@ def export_bambu_ams_color_package(
         mesh_uv=ams_mesh_uv,
         dem=dem,
         pond_sensitivity=pond_sensitivity,
+        pond_mask=pond_mask,
         voxel_size_mm=voxel_size_mm,
         on_progress=on_progress,
     )

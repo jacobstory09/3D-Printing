@@ -21,7 +21,7 @@ from terrain_app.job_cleanup import (
     prune_job_artifacts,
     start_cleanup_scheduler,
 )
-from terrain_app.pipeline import export_download_filename, load_meta, process_kml
+from terrain_app.pipeline import build_ams_from_job, export_download_filename, load_meta, process_kml
 from terrain_app.progress import load_progress, progress_reporter_with_timeout, write_progress
 
 _PROCESS_SEMAPHORE = threading.Semaphore(1)
@@ -76,7 +76,7 @@ def create_app() -> Flask:
         try:
             vz = float(request.form.get("vertical_exaggeration") or 3)
         except ValueError:
-            vz = 1.0
+            vz = 3.0
         vz = max(0.01, vz)
         try:
             print_max = float(request.form.get("print_max_size_mm") or 200)
@@ -244,6 +244,8 @@ def create_app() -> Flask:
         except FileNotFoundError:
             return jsonify({"error": "Unknown job"}), 404
         dem_path = cache_root / job_id / "heights_display.npy"
+        if not dem_path.is_file():
+            return jsonify({"error": "Not found"}), 404
         dem = np.load(dem_path, mmap_mode="r")
         heights_b64 = None
         try:
@@ -404,6 +406,90 @@ def create_app() -> Flask:
             as_attachment=True,
             download_name=export_download_filename(meta, suffix),
         )
+
+    @app.get("/api/result/<job_id>/pond_shapes.json")
+    def api_pond_shapes(job_id: str):
+        p = cache_root / job_id / "pond_shapes.json"
+        if not p.is_file():
+            return jsonify({"error": "Not found"}), 404
+        return send_file(p, mimetype="application/json")
+
+    @app.post("/api/result/<job_id>/build_ams")
+    def api_build_ams(job_id: str):
+        job_dir = cache_root / job_id
+        if not job_dir.is_dir():
+            return jsonify({"error": "Unknown job"}), 404
+        try:
+            meta = load_meta(cache_root, job_id)
+        except FileNotFoundError:
+            return jsonify({"error": "Unknown job"}), 404
+        ponds = meta.get("ponds") or {}
+        if ponds.get("status") not in ("pending_edit", "exported"):
+            return jsonify({"error": "AMS pond review not available for this job"}), 400
+        if not (job_dir / "print_cache.glb").is_file():
+            return jsonify({"error": "Print cache missing; rebuild the scene"}), 400
+        body = request.get_json(silent=True) or {}
+        shapes = body.get("shapes")
+        if not isinstance(shapes, list):
+            return jsonify({"error": "Request body must include a shapes array"}), 400
+
+        started_at = time.time()
+        write_progress(
+            job_dir,
+            status="running",
+            step="build_ams",
+            message="Building AMS export…",
+            percent=5,
+            started_at=started_at,
+        )
+
+        def worker() -> None:
+            with active_jobs_lock:
+                active_jobs.add(job_id)
+            try:
+                with _PROCESS_SEMAPHORE:
+                    report = progress_reporter_with_timeout(
+                        job_dir,
+                        max_runtime_sec=job_cfg.max_runtime_sec,
+                        started_at=started_at,
+                    )
+                    try:
+                        build_ams_from_job(job_dir, shapes, report=report)
+                        write_progress(
+                            job_dir,
+                            status="done",
+                            step="done",
+                            message="AMS export ready",
+                            percent=100,
+                            started_at=started_at,
+                        )
+                    except JobTimeoutError as e:
+                        write_progress(
+                            job_dir,
+                            status="error",
+                            step="timeout",
+                            message=str(e),
+                            percent=100,
+                            error=str(e),
+                            started_at=started_at,
+                        )
+                    except Exception as e:
+                        app.logger.exception("build_ams failed")
+                        write_progress(
+                            job_dir,
+                            status="error",
+                            step="error",
+                            message="AMS export failed",
+                            percent=100,
+                            error=str(e),
+                            started_at=started_at,
+                        )
+            finally:
+                with active_jobs_lock:
+                    active_jobs.discard(job_id)
+
+        threading.Thread(target=worker, daemon=True).start()
+        return jsonify({"ok": True, "job_id": job_id}), 202
 
     @app.get("/api/result/<job_id>/ams_preview.png")
     def api_ams_preview(job_id: str):

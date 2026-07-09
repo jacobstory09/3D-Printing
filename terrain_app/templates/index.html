@@ -248,6 +248,57 @@
       border-color: var(--accent);
       color: var(--accent);
     }
+    .pond-editor {
+      margin-top: 0.75rem;
+      padding: 0.65rem;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--bg);
+    }
+    .pond-editor[hidden] {
+      display: none;
+    }
+    .pond-editor h3 {
+      margin: 0 0 0.5rem;
+      font-size: 0.8rem;
+      font-weight: 600;
+    }
+    .pond-editor .pond-hint {
+      font-size: 0.7rem;
+      color: var(--muted);
+      margin: 0 0 0.5rem;
+      line-height: 1.35;
+    }
+    .pond-tools {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.35rem;
+      margin-bottom: 0.5rem;
+    }
+    .pond-tools button {
+      margin: 0;
+      width: auto;
+      padding: 0.35rem 0.55rem;
+      font-size: 0.72rem;
+    }
+    .pond-tools button.is-active {
+      border-color: var(--accent);
+      color: var(--accent);
+    }
+    .pond-show-check {
+      display: flex;
+      align-items: center;
+      gap: 0.4rem;
+      font-size: 0.75rem;
+      margin-bottom: 0.5rem;
+      cursor: pointer;
+      text-transform: none;
+      letter-spacing: normal;
+    }
+    .pond-show-check input {
+      width: auto;
+      margin: 0;
+    }
   </style>
 </head>
 <body>
@@ -330,6 +381,19 @@
       <label class="export-check"><input type="checkbox" id="export-quad-mask" /> Quad mask overlay</label>
     </details>
     <button id="run" type="button">Build scene</button>
+    <div class="pond-editor" id="pond-editor" hidden>
+      <h3>Ponds / lakes (AMS)</h3>
+      <p class="pond-hint">Click to add corners · double-click or Finish to close · Delete: click a pond</p>
+      <label class="pond-show-check"><input type="checkbox" id="pond-show" checked /> Show ponds on map</label>
+      <div class="pond-tools">
+        <button type="button" id="pond-mode-nav" class="is-active">Pan map</button>
+        <button type="button" id="pond-mode-draw">Draw pond</button>
+        <button type="button" id="pond-mode-delete">Delete pond</button>
+        <button type="button" id="pond-finish" hidden>Finish shape</button>
+        <button type="button" id="pond-cancel" hidden>Cancel</button>
+      </div>
+      <button id="build-ams" type="button">Build AMS export</button>
+    </div>
     <div class="progress-wrap" id="progress-wrap" hidden>
       <progress id="progress-bar" max="100" value="0"></progress>
       <div class="progress-label" id="progress-label">Starting…</div>

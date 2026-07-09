@@ -24,6 +24,7 @@ from terrain_app.export_options import ExportOptions, normalize_ams_quality
 from terrain_app import imagery as imagery_mod
 from terrain_app import kml as kml_mod
 from terrain_app import mesh as mesh_mod
+from terrain_app import pond_shapes
 from terrain_app.progress import progress_reporter, write_progress
 
 ImageryKind = Literal["osm", "oam", "esri"]
@@ -53,6 +54,164 @@ def export_download_filename(meta: Dict[str, Any], suffix: str) -> str:
 
 def _save_json(path: Path, data: Dict[str, Any]) -> None:
     path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
+PRINT_CACHE_GLB = "print_cache.glb"
+POND_SHAPES_JSON = "pond_shapes.json"
+
+
+def _save_print_cache(job_dir: Path, print_mesh: trimesh.Trimesh, surf_mm: trimesh.Trimesh) -> None:
+    scene = trimesh.Scene()
+    scene.add_geometry(print_mesh, geom_name="print_mesh")
+    scene.add_geometry(surf_mm, geom_name="surf_mm")
+    scene.export(job_dir / PRINT_CACHE_GLB)
+
+
+def _load_print_cache(job_dir: Path) -> tuple[trimesh.Trimesh, trimesh.Trimesh]:
+    path = job_dir / PRINT_CACHE_GLB
+    if not path.is_file():
+        raise FileNotFoundError("print_cache.glb")
+    loaded = trimesh.load(path, force="scene")
+    if not isinstance(loaded, trimesh.Scene):
+        raise ValueError("print_cache.glb is not a scene")
+    # trimesh preserves geom_name on export/import
+    if "print_mesh" not in loaded.geometry or "surf_mm" not in loaded.geometry:
+        names = list(loaded.geometry.keys())
+        if len(names) < 2:
+            raise ValueError("print_cache.glb missing print_mesh or surf_mm")
+        print_mesh = loaded.geometry[names[0]]
+        surf_mm = loaded.geometry[names[1]]
+    else:
+        print_mesh = loaded.geometry["print_mesh"]
+        surf_mm = loaded.geometry["surf_mm"]
+    if not isinstance(print_mesh, trimesh.Trimesh) or not isinstance(surf_mm, trimesh.Trimesh):
+        raise ValueError("print_cache geometries must be meshes")
+    return print_mesh, surf_mm
+
+
+def _prepare_pond_shapes_for_job(
+    job_dir: Path,
+    job_id: str,
+    texture_rgba: np.ndarray,
+    dem: np.ndarray,
+    *,
+    pond_sensitivity: str,
+    grid_width: int,
+    grid_height: int,
+) -> dict[str, Any]:
+    pond_mask_auto = ams_color.detect_pond_mask(
+        texture_rgba, dem=dem, sensitivity=pond_sensitivity
+    )
+    shapes = pond_shapes.mask_to_polygons(pond_mask_auto)
+    pond_doc: dict[str, Any] = {
+        "shapes": shapes,
+        "auto_count": len(shapes),
+        "sensitivity": pond_sensitivity,
+        "grid_width": int(grid_width),
+        "grid_height": int(grid_height),
+    }
+    _save_json(job_dir / POND_SHAPES_JSON, pond_doc)
+    return {
+        "status": "pending_edit",
+        "shape_count": len(shapes),
+        "url": f"/api/result/{job_id}/pond_shapes.json",
+    }
+
+
+def build_ams_from_job(
+    job_dir: Path,
+    shapes: list[dict[str, Any]],
+    *,
+    report: Callable[[str, str, int], None] | None = None,
+) -> None:
+    """Build AMS exports from cached print solid and user-approved pond polygons."""
+    log = logging.getLogger("terrain_app.pipeline")
+    meta_path = job_dir / "meta.json"
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    job_id = str(meta.get("job_id") or job_dir.name)
+    if report is None:
+        report = progress_reporter(job_dir)
+
+    h = int(meta["grid_height"])
+    w = int(meta["grid_width"])
+    pond_sensitivity = ams_color.normalize_pond_sensitivity(
+        str(meta.get("pond_sensitivity") or "conservative")
+    )
+    ams_n_colors = ams_color.clamp_ams_n_colors(int(meta.get("ams_n_colors") or 4))
+    ams_quality = normalize_ams_quality(str(meta.get("ams_quality") or "medium"))
+    exports_req = meta.get("exports", {}).get("requested", {})
+    exports_built = meta.setdefault("exports", {}).setdefault("built", {})
+
+    report("build_ams", "Loading cached print solid…", 10)
+    print_mesh, surf_mm = _load_print_cache(job_dir)
+    texture_rgba = np.array(Image.open(job_dir / "texture.png"), dtype=np.uint8)
+    dem = np.load(job_dir / "dem.npy")
+
+    footprint = pond_shapes.footprint_from_rgba(texture_rgba)
+    validated = pond_shapes.validate_shapes(shapes, h, w)
+    pond_mask = pond_shapes.polygons_to_mask(validated, h, w, footprint)
+
+    pond_doc: dict[str, Any] = {
+        "shapes": validated,
+        "auto_count": len([s for s in validated if s.get("source") == "auto"]),
+        "sensitivity": pond_sensitivity,
+        "grid_width": w,
+        "grid_height": h,
+    }
+    _save_json(job_dir / POND_SHAPES_JSON, pond_doc)
+
+    print_info = meta.setdefault("print", {})
+    ams_t0 = time.time()
+
+    def _ams_progress(msg: str) -> None:
+        elapsed = int(time.time() - ams_t0)
+        suffix = f" ({elapsed}s)" if elapsed >= 8 else ""
+        report("build_ams", f"{msg}{suffix}", 55)
+
+    _ams_progress(f"Building {ams_n_colors}-color Bambu AMS export…")
+    ams_mesh: trimesh.Trimesh | None = None
+    ams_bytes, ams_meta, ams_preview, ams_labels, ams_palette, ams_mesh = (
+        mesh_mod.export_bambu_ams_color_package(
+            print_mesh,
+            surf_mm,
+            texture_rgba,
+            dem=dem,
+            pond_sensitivity=pond_sensitivity,
+            pond_mask=pond_mask,
+            n_colors=ams_n_colors,
+            voxel_size_mm=print_info.get("print_voxel_size_mm"),
+            ams_quality=ams_quality,
+            on_progress=_ams_progress,
+        )
+    )
+    if exports_req.get("print_ams", True):
+        ams_filename = str(ams_meta.get("filename") or "terrain_print_ams_obj.zip")
+        (job_dir / ams_filename).write_bytes(ams_bytes)
+        ams_preview.save(job_dir / "terrain_print_ams_preview.png", format="PNG")
+        exports_built["print_ams"] = True
+    del ams_bytes, ams_preview
+
+    print_info["ams"] = ams_meta
+    print_info["ams"]["print_ams_glb"] = False
+    exports_built["print_ams_glb"] = False
+    if exports_req.get("print_ams_glb") and ams_mesh is not None:
+        try:
+            (job_dir / "terrain_print_ams.glb").write_bytes(
+                mesh_mod.export_ams_print_glb_labeled(ams_mesh, ams_labels, ams_palette)
+            )
+            print_info["ams"]["print_ams_glb"] = True
+            exports_built["print_ams_glb"] = True
+        except Exception:
+            log.exception("AMS print GLB build failed")
+    del ams_labels, ams_palette, ams_mesh
+
+    meta["ponds"] = {
+        "status": "exported",
+        "shape_count": len(validated),
+        "url": f"/api/result/{job_id}/pond_shapes.json",
+    }
+    _save_json(meta_path, meta)
+    report("build_ams", "AMS export ready", 100)
 
 
 def process_kml(
@@ -250,7 +409,7 @@ def process_kml(
             report("print", "Building watertight print solid…", 85)
             print_mesh, print_info, surf_mm = mesh_mod.build_print_solid(
                 mesh,
-                poly_utm,
+                clip_poly_utm,
                 print_max_size_mm=pms,
                 base_extrusion_mm=pbe,
                 center_on_bed=print_center_on_bed,
@@ -258,6 +417,7 @@ def process_kml(
                 print_split_nx=spx,
                 print_split_nz=spz,
             )
+            # Keep dem and texture_rgba until AMS export (pond detection) finishes below.
             del mesh, z_display, mask
             gc.collect()
             pmb = print_mesh.bounds
@@ -286,56 +446,23 @@ def process_kml(
                 except Exception:
                     log.exception("textured print GLB build failed")
             if exports.needs_ams():
-                ams_t0 = time.time()
-
-                def _ams_progress(msg: str) -> None:
-                    elapsed = int(time.time() - ams_t0)
-                    suffix = f" ({elapsed}s)" if elapsed >= 8 else ""
-                    report("print_ams", f"{msg}{suffix}", 95)
-
-                _ams_progress(f"Building {ams_n_colors}-color Bambu AMS export…")
+                report("ponds", "Detecting ponds for map review…", 94)
                 try:
-                    ams_mesh: trimesh.Trimesh | None = None
-                    ams_bytes, ams_meta, ams_preview, ams_labels, ams_palette, ams_mesh = (
-                        mesh_mod.export_bambu_ams_color_package(
-                            print_mesh,
-                            surf_mm,
-                            texture_rgba,
-                            dem=dem,
-                            pond_sensitivity=pond_sensitivity,
-                            n_colors=ams_n_colors,
-                            voxel_size_mm=print_info.get("print_voxel_size_mm"),
-                            ams_quality=ams_quality,
-                            on_progress=_ams_progress,
-                        )
+                    _save_print_cache(job_dir, print_mesh, surf_mm)
+                    ponds_meta = _prepare_pond_shapes_for_job(
+                        job_dir,
+                        job_id,
+                        texture_rgba,
+                        dem,
+                        pond_sensitivity=pond_sensitivity,
+                        grid_width=dst_width,
+                        grid_height=dst_height,
                     )
-                    if exports.print_ams:
-                        ams_filename = str(
-                            ams_meta.get("filename") or "terrain_print_ams_obj.zip"
-                        )
-                        (job_dir / ams_filename).write_bytes(ams_bytes)
-                        ams_preview.save(
-                            job_dir / "terrain_print_ams_preview.png", format="PNG"
-                        )
-                        built["print_ams"] = True
-                    del ams_bytes, ams_preview
-                    print_info["ams"] = ams_meta
-                    print_info["ams"]["print_ams_glb"] = False
-                    if exports.print_ams_glb and ams_mesh is not None:
-                        try:
-                            (job_dir / "terrain_print_ams.glb").write_bytes(
-                                mesh_mod.export_ams_print_glb_labeled(
-                                    ams_mesh, ams_labels, ams_palette
-                                )
-                            )
-                            print_info["ams"]["print_ams_glb"] = True
-                            built["print_ams_glb"] = True
-                        except Exception:
-                            log.exception("AMS print GLB build failed")
-                    del ams_labels, ams_palette, ams_mesh
+                    meta["ponds"] = ponds_meta
+                    print_info["ams"] = {"ok": False, "pending": True}
                 except Exception:
-                    log.exception("Bambu AMS color export failed")
-                    print_info["ams"] = {"ok": False, "error": "ams_export_failed"}
+                    log.exception("Pond preparation for AMS review failed")
+                    print_info["ams"] = {"ok": False, "error": "pond_prepare_failed"}
             del mesh_uv, texture_rgba, dem
             gc.collect()
             print_info["ok"] = True
@@ -395,7 +522,16 @@ def process_kml(
         meta["print"]["voxel_size_mm_request"] = float(print_voxel_size_mm)
     meta["print"].update(print_info)
     _save_json(job_dir / "meta.json", meta)
-    write_progress(job_dir, status="done", step="done", message="Ready", percent=100)
+    if exports.needs_ams() and meta.get("ponds", {}).get("status") == "pending_edit":
+        write_progress(
+            job_dir,
+            status="done",
+            step="ponds",
+            message="Review ponds on the map, then build AMS export",
+            percent=100,
+        )
+    else:
+        write_progress(job_dir, status="done", step="done", message="Ready", percent=100)
     return job_id
 
 

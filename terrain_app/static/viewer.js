@@ -14,6 +14,11 @@ const lnkPiecesZip = document.getElementById("lnk-pieces-zip");
 const amsColorsEl = document.getElementById("ams-colors");
 const amsColorListEl = document.getElementById("ams-color-list");
 const viewport = document.getElementById("viewport");
+const pondEditorEl = document.getElementById("pond-editor");
+const pondShowEl = document.getElementById("pond-show");
+const pondFinishBtn = document.getElementById("pond-finish");
+const pondCancelBtn = document.getElementById("pond-cancel");
+const buildAmsBtn = document.getElementById("build-ams");
 
 let canvas;
 let ctx;
@@ -23,6 +28,13 @@ let mapImage = null;
 /** Screen-space pan/zoom: image drawn at (offsetX, offsetY) with uniform scale. */
 let view = { scale: 1, offsetX: 0, offsetY: 0 };
 let drag = null;
+let currentJobId = null;
+/** @type {Array<{id: string, source: string, vertices: number[][]}>} */
+let pondShapes = [];
+let pondMode = "navigate";
+/** @type {number[][]} */
+let draftVertices = [];
+let showPonds = true;
 
 function initCanvas() {
   if (canvas) return;
@@ -34,6 +46,7 @@ function initCanvas() {
   canvas.addEventListener("pointermove", onPointerMove);
   canvas.addEventListener("pointerup", onPointerUp);
   canvas.addEventListener("pointercancel", onPointerUp);
+  canvas.addEventListener("dblclick", onPointerDblClick);
   canvas.addEventListener("wheel", onWheel, { passive: false });
   resizeObserver = new ResizeObserver(onResize);
   resizeObserver.observe(viewport);
@@ -69,6 +82,88 @@ function fitView() {
   draw();
 }
 
+function screenToTexture(sx, sy) {
+  return {
+    col: (sx - view.offsetX) / view.scale,
+    row: (sy - view.offsetY) / view.scale,
+  };
+}
+
+function textureToScreen(col, row) {
+  return {
+    sx: view.offsetX + col * view.scale,
+    sy: view.offsetY + row * view.scale,
+  };
+}
+
+function newShapeId() {
+  if (typeof crypto !== "undefined" && crypto.randomUUID) {
+    return crypto.randomUUID();
+  }
+  return `pond-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function pointInPolygon(col, row, vertices) {
+  let inside = false;
+  for (let i = 0, j = vertices.length - 1; i < vertices.length; j = i++) {
+    const xi = vertices[i][0];
+    const yi = vertices[i][1];
+    const xj = vertices[j][0];
+    const yj = vertices[j][1];
+    const intersect =
+      yi > row !== yj > row &&
+      col < ((xj - xi) * (row - yi)) / (yj - yi + 1e-12) + xi;
+    if (intersect) inside = !inside;
+  }
+  return inside;
+}
+
+function drawPondOverlays() {
+  if (!ctx || !mapImage || !showPonds) return;
+  const drawPoly = (vertices, fill, stroke, lineWidth = 2) => {
+    if (!vertices || vertices.length < 2) return;
+    ctx.beginPath();
+    const p0 = textureToScreen(vertices[0][0], vertices[0][1]);
+    ctx.moveTo(p0.sx, p0.sy);
+    for (let i = 1; i < vertices.length; i++) {
+      const p = textureToScreen(vertices[i][0], vertices[i][1]);
+      ctx.lineTo(p.sx, p.sy);
+    }
+    ctx.closePath();
+    if (fill) {
+      ctx.fillStyle = fill;
+      ctx.fill();
+    }
+    if (stroke) {
+      ctx.strokeStyle = stroke;
+      ctx.lineWidth = lineWidth;
+      ctx.stroke();
+    }
+  };
+  for (const sh of pondShapes) {
+    drawPoly(sh.vertices, "rgba(45, 120, 180, 0.35)", "rgba(70, 160, 220, 0.9)");
+  }
+  if (draftVertices.length > 0) {
+    ctx.beginPath();
+    const d0 = textureToScreen(draftVertices[0][0], draftVertices[0][1]);
+    ctx.moveTo(d0.sx, d0.sy);
+    for (let i = 1; i < draftVertices.length; i++) {
+      const p = textureToScreen(draftVertices[i][0], draftVertices[i][1]);
+      ctx.lineTo(p.sx, p.sy);
+    }
+    ctx.strokeStyle = "rgba(255, 220, 80, 0.95)";
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    for (const v of draftVertices) {
+      const p = textureToScreen(v[0], v[1]);
+      ctx.beginPath();
+      ctx.arc(p.sx, p.sy, 4, 0, Math.PI * 2);
+      ctx.fillStyle = "rgba(255, 220, 80, 0.95)";
+      ctx.fill();
+    }
+  }
+}
+
 function draw() {
   if (!ctx || !canvas) return;
   const { w, h } = viewportSize();
@@ -85,6 +180,56 @@ function draw() {
     mapImage.width * view.scale,
     mapImage.height * view.scale
   );
+  drawPondOverlays();
+}
+
+function updatePondModeUi() {
+  const nav = document.getElementById("pond-mode-nav");
+  const drawBtn = document.getElementById("pond-mode-draw");
+  const delBtn = document.getElementById("pond-mode-delete");
+  nav?.classList.toggle("is-active", pondMode === "navigate");
+  drawBtn?.classList.toggle("is-active", pondMode === "draw");
+  delBtn?.classList.toggle("is-active", pondMode === "delete");
+  if (pondFinishBtn) pondFinishBtn.hidden = pondMode !== "draw" || draftVertices.length < 3;
+  if (pondCancelBtn) pondCancelBtn.hidden = pondMode !== "draw" || draftVertices.length === 0;
+  if (canvas) {
+    canvas.style.cursor =
+      pondMode === "navigate" ? "grab" : pondMode === "draw" ? "crosshair" : "pointer";
+  }
+}
+
+function setPondMode(mode) {
+  pondMode = mode;
+  if (mode !== "draw") draftVertices = [];
+  updatePondModeUi();
+  draw();
+}
+
+function finishDraftPolygon() {
+  if (draftVertices.length < 3) return;
+  pondShapes.push({
+    id: newShapeId(),
+    source: "manual",
+    vertices: draftVertices.map((v) => [v[0], v[1]]),
+  });
+  draftVertices = [];
+  setPondMode("navigate");
+}
+
+function deletePondAt(col, row) {
+  for (let i = pondShapes.length - 1; i >= 0; i--) {
+    if (pointInPolygon(col, row, pondShapes[i].vertices)) {
+      pondShapes.splice(i, 1);
+      draw();
+      return true;
+    }
+  }
+  return false;
+}
+
+function canvasPoint(ev) {
+  const rect = canvas.getBoundingClientRect();
+  return { sx: ev.clientX - rect.left, sy: ev.clientY - rect.top };
 }
 
 function onResize() {
@@ -127,9 +272,28 @@ function onWheel(ev) {
 
 function onPointerDown(ev) {
   if (ev.button !== 0) return;
+  const { sx, sy } = canvasPoint(ev);
+  if (pondMode === "draw") {
+    const { col, row } = screenToTexture(sx, sy);
+    draftVertices.push([col, row]);
+    updatePondModeUi();
+    draw();
+    return;
+  }
+  if (pondMode === "delete") {
+    const { col, row } = screenToTexture(sx, sy);
+    deletePondAt(col, row);
+    return;
+  }
   canvas.setPointerCapture(ev.pointerId);
   canvas.style.cursor = "grabbing";
   drag = { x: ev.clientX, y: ev.clientY, ox: view.offsetX, oy: view.offsetY };
+}
+
+function onPointerDblClick(ev) {
+  if (pondMode !== "draw" || draftVertices.length < 3) return;
+  ev.preventDefault();
+  finishDraftPolygon();
 }
 
 function onPointerMove(ev) {
@@ -281,6 +445,18 @@ function setExportLink(anchor, href, downloadName) {
   else anchor.removeAttribute("download");
 }
 
+function swatchHexForColor(c) {
+  if (c.role === "pond" && Array.isArray(c.filament_rgb) && c.filament_rgb.length >= 3) {
+    return (
+      "#" +
+      c.filament_rgb
+        .map((x) => Math.max(0, Math.min(255, Number(x) | 0)).toString(16).padStart(2, "0"))
+        .join("")
+    );
+  }
+  return c.hex || "#888";
+}
+
 function renderAmsColors(ams) {
   if (!amsColorListEl || !amsColorsEl) return;
   if (!ams || !ams.ok || !Array.isArray(ams.colors) || ams.colors.length === 0) {
@@ -290,14 +466,15 @@ function renderAmsColors(ams) {
   }
   amsColorListEl.innerHTML = "";
   for (const c of ams.colors) {
+    const hex = swatchHexForColor(c);
     const row = document.createElement("div");
     row.className = "ams-color-row";
     const swatch = document.createElement("span");
     swatch.className = "ams-swatch";
-    swatch.style.background = c.hex || "#888";
-    swatch.title = c.hex || "";
+    swatch.style.background = hex;
+    swatch.title = hex;
     const label = document.createElement("div");
-    label.innerHTML = `<strong>${c.name || c.part_name || "Color"}</strong><div class="ams-color-meta">${c.part_name || ""} · ${c.hex || ""} · ${c.coverage_pct != null ? `${c.coverage_pct}%` : ""}</div>`;
+    label.innerHTML = `<strong>${c.name || c.part_name || "Color"}</strong><div class="ams-color-meta">${c.part_name || ""} · ${hex} · ${c.coverage_pct != null ? `${c.coverage_pct}%` : ""}</div>`;
     const tris = document.createElement("div");
     tris.className = "ams-color-meta";
     tris.textContent = c.triangle_count != null ? `${c.triangle_count} tris` : "";
@@ -309,7 +486,257 @@ function renderAmsColors(ams) {
   amsColorsEl.hidden = false;
 }
 
+function pondsPending(meta) {
+  const ponds = meta && meta.ponds;
+  return Boolean(ponds && ponds.status === "pending_edit");
+}
+
+async function loadPondShapes(jobId) {
+  const r = await fetch(`/api/result/${jobId}/pond_shapes.json`);
+  const doc = await readJson(r);
+  if (!r.ok) throw new Error(doc.error || "Failed to load pond shapes");
+  pondShapes = Array.isArray(doc.shapes) ? doc.shapes : [];
+  draw();
+}
+
+function setupPondEditor(jobId, meta) {
+  currentJobId = jobId;
+  if (!pondsPending(meta)) {
+    if (pondEditorEl) pondEditorEl.hidden = true;
+    return;
+  }
+  if (pondEditorEl) pondEditorEl.hidden = false;
+  setPondMode("navigate");
+  loadPondShapes(jobId).catch((e) => setStatus(String(e.message || e)));
+}
+
+function wireExportLinks(jobId, meta) {
+  const jobBuilt = (key) => exportBuilt(meta, key);
+  if (jobBuilt("preview_glb")) {
+    setExportLink(lnkGlb, `/api/result/${jobId}/export.glb`, exportDownloadName(meta, ".glb"));
+    lnkGlb?.removeAttribute("aria-disabled");
+  } else {
+    setExportLink(lnkGlb, "#", null);
+    lnkGlb?.setAttribute("aria-disabled", "true");
+  }
+  if (jobBuilt("preview_obj")) {
+    setExportLink(lnkZip, `/api/result/${jobId}/export.zip`, exportDownloadName(meta, "_obj.zip"));
+    lnkZip?.removeAttribute("aria-disabled");
+  } else {
+    setExportLink(lnkZip, "#", null);
+    lnkZip?.setAttribute("aria-disabled", "true");
+  }
+  if (meta.print && meta.print.ok) {
+    if (jobBuilt("print_stl")) {
+      setExportLink(lnkStl, `/api/result/${jobId}/export.stl`, exportDownloadName(meta, "_print.stl"));
+      lnkStl?.removeAttribute("aria-disabled");
+    } else {
+      setExportLink(lnkStl, "#", null);
+      lnkStl?.setAttribute("aria-disabled", "true");
+    }
+    if (jobBuilt("print_textured_glb")) {
+      setExportLink(
+        lnkPrintTexturedGlb,
+        `/api/result/${jobId}/export_print_textured.glb`,
+        exportDownloadName(meta, "_print_textured.glb")
+      );
+      lnkPrintTexturedGlb?.removeAttribute("aria-disabled");
+    } else {
+      setExportLink(lnkPrintTexturedGlb, "#", null);
+      lnkPrintTexturedGlb?.setAttribute("aria-disabled", "true");
+    }
+    if (jobBuilt("print_3mf")) {
+      setExportLink(lnk3mf, `/api/result/${jobId}/export.3mf`, exportDownloadName(meta, "_print.3mf"));
+      lnk3mf?.removeAttribute("aria-disabled");
+    } else {
+      setExportLink(lnk3mf, "#", null);
+      lnk3mf?.setAttribute("aria-disabled", "true");
+    }
+    const ams = meta.print && meta.print.ams;
+    if (jobBuilt("print_ams") && ams && ams.ok) {
+      const amsSuffix = ams.download_suffix || "_print_ams_obj.zip";
+      setExportLink(
+        lnkAmsColor,
+        `/api/result/${jobId}/export_print_ams`,
+        exportDownloadName(meta, amsSuffix)
+      );
+      lnkAmsColor?.removeAttribute("aria-disabled");
+      renderAmsColors(ams);
+    } else {
+      setExportLink(lnkAmsColor, "#", null);
+      lnkAmsColor?.setAttribute("aria-disabled", "true");
+      if (ams && ams.ok) renderAmsColors(ams);
+      else renderAmsColors(null);
+    }
+    if (jobBuilt("print_ams_glb") && ams && ams.print_ams_glb) {
+      setExportLink(
+        lnkPrintAmsGlb,
+        `/api/result/${jobId}/export_print_ams.glb`,
+        exportDownloadName(meta, "_print_ams.glb")
+      );
+      lnkPrintAmsGlb?.removeAttribute("aria-disabled");
+    } else {
+      setExportLink(lnkPrintAmsGlb, "#", null);
+      lnkPrintAmsGlb?.setAttribute("aria-disabled", "true");
+    }
+  } else {
+    setExportLink(lnkStl, "#", null);
+    lnkStl?.setAttribute("aria-disabled", "true");
+    setExportLink(lnkPrintTexturedGlb, "#", null);
+    lnkPrintTexturedGlb?.setAttribute("aria-disabled", "true");
+    setExportLink(lnkPrintAmsGlb, "#", null);
+    lnkPrintAmsGlb?.setAttribute("aria-disabled", "true");
+    setExportLink(lnk3mf, "#", null);
+    lnk3mf?.setAttribute("aria-disabled", "true");
+    setExportLink(lnkAmsColor, "#", null);
+    lnkAmsColor?.setAttribute("aria-disabled", "true");
+    renderAmsColors(null);
+  }
+  const pz = meta.print && meta.print.pieces;
+  if (jobBuilt("print_pieces") && pz && pz.ok && pz.count > 0) {
+    setExportLink(
+      lnkPiecesZip,
+      `/api/result/${jobId}/export_print_pieces.zip`,
+      exportDownloadName(meta, "_print_pieces.zip")
+    );
+    lnkPiecesZip?.removeAttribute("aria-disabled");
+  } else {
+    setExportLink(lnkPiecesZip, "#", null);
+    lnkPiecesZip?.setAttribute("aria-disabled", "true");
+  }
+  exportsEl.hidden = false;
+}
+
+function buildStatusText(meta, jobId) {
+  const pz = meta.print && meta.print.pieces;
+  const splitDesc =
+    meta.print && (meta.print.split_nx > 1 || meta.print.split_nz > 1)
+      ? `Puzzle: ${meta.print.split_nx}×${meta.print.split_nz} (each tile scaled to ~print max mm on ground; monolithic STL is full assembly)\n`
+      : "";
+  const piecesLine =
+    pz && pz.count > 0
+      ? `Puzzle STLs: ${pz.count} file(s), ~${
+          pz.per_piece_size_mm
+            ? (
+                pz.per_piece_size_mm.max_horizontal_mm_approx != null
+                  ? Number(pz.per_piece_size_mm.max_horizontal_mm_approx)
+                  : Math.max(pz.per_piece_size_mm.x, pz.per_piece_size_mm.y ?? 0)
+              ).toFixed(1)
+            : "?"
+        } mm max on ground per tile\n`
+      : meta.print && (meta.print.split_nx > 1 || meta.print.split_nz > 1)
+        ? `Puzzle STLs: none (split failed or empty)\n`
+        : "";
+  const printLine =
+    meta.print && meta.print.ok
+      ? `Print STL: ${meta.print.print_max_size_mm ?? meta.print.max_size_mm} mm max, base ${meta.print.base_extrusion_mm} mm, voxel ${
+          meta.print.voxel_size_mm_request != null
+            ? meta.print.voxel_size_mm_request
+            : meta.print.print_voxel_size_mm != null
+              ? `auto (~${Number(meta.print.print_voxel_size_mm).toFixed(2)} mm)`
+              : "auto"
+        }${
+          meta.print.print_vertical_span_mm != null
+            ? `, model height ~${Number(meta.print.print_vertical_span_mm).toFixed(2)} mm (slicer Z)`
+            : ""
+        }\n`
+      : meta.print && (meta.print.error || !meta.print.ok)
+        ? `Print STL: unavailable\n`
+        : "";
+  const multiBodyWarn =
+    meta.print && meta.print.ok && meta.print.print_component_count > 1
+      ? `Warning: print mesh has ${meta.print.print_component_count} separate bodies (expected one)\n`
+      : "";
+  const fullRel = meta.full_raster_relief_m;
+  const clipRel = meta.clipped_surface_relief_m;
+  const reliefHint =
+    fullRel != null && clipRel != null && fullRel > 1 && clipRel < 0.05 * fullRel
+      ? `Note: KML footprint is much flatter than the full download tile; preview matches print.\n`
+      : "";
+  const vex = meta.vertical_exaggeration != null ? Number(meta.vertical_exaggeration) : 1;
+  const meshZSpan =
+    meta.mesh_vertex_z_span_m != null
+      ? meta.mesh_vertex_z_span_m
+      : meta.mesh_vertex_y_span_m != null
+        ? meta.mesh_vertex_y_span_m
+        : null;
+  const meshZLine =
+    meshZSpan != null
+      ? `Terrain mesh: DEM → vertex Z span ${Number(meshZSpan).toFixed(2)} m (×${vex} vex); same Z in print STL (mm after scaling).\n`
+      : "";
+  const maskR = meta.masked_raster_relief_m;
+  const reliefMismatch =
+    maskR != null &&
+    meshZSpan != null &&
+    maskR > 0.5 &&
+    meshZSpan < 0.05 * maskR
+      ? `Warning: footprint DEM varies ~${Number(maskR).toFixed(2)} m but triangulated mesh only ~${Number(meshZSpan).toFixed(2)} m—possible polygon vs grid mismatch.\n`
+      : "";
+  const pondLine = pondsPending(meta)
+    ? `Ponds: review ${meta.ponds.shape_count ?? 0} suggested shape(s) on the map, then Build AMS export.\n`
+    : "";
+  return (
+    `EPSG:${meta.epsg} · ${meta.grid_width}×${meta.grid_height}\n` +
+    (meta.elevation_min_m != null
+      ? `Elev ${meta.elevation_min_m.toFixed(1)}–${meta.elevation_max_m.toFixed(1)} m (raw DEM)\n`
+      : "") +
+    meshZLine +
+    reliefMismatch +
+    reliefHint +
+    pondLine +
+    splitDesc +
+    piecesLine +
+    printLine +
+    multiBodyWarn +
+    `Job ${jobId}`
+  );
+}
+
 document.getElementById("view-reset")?.addEventListener("click", fitView);
+
+document.getElementById("pond-mode-nav")?.addEventListener("click", () => setPondMode("navigate"));
+document.getElementById("pond-mode-draw")?.addEventListener("click", () => setPondMode("draw"));
+document.getElementById("pond-mode-delete")?.addEventListener("click", () => setPondMode("delete"));
+pondFinishBtn?.addEventListener("click", () => finishDraftPolygon());
+pondCancelBtn?.addEventListener("click", () => {
+  draftVertices = [];
+  setPondMode("navigate");
+});
+pondShowEl?.addEventListener("change", () => {
+  showPonds = Boolean(pondShowEl.checked);
+  draw();
+});
+
+buildAmsBtn?.addEventListener("click", async () => {
+  if (!currentJobId) return;
+  if (buildAmsBtn.disabled) return;
+  buildAmsBtn.disabled = true;
+  setProgress("Building AMS export…", 5);
+  try {
+    const resp = await fetch(`/api/result/${currentJobId}/build_ams`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ shapes: pondShapes }),
+    });
+    const body = await readJson(resp);
+    if (!resp.ok) throw new Error(body.error || resp.statusText);
+    await waitForJob(currentJobId);
+    hideProgress();
+    const rr = await fetch(`/api/result/${currentJobId}`);
+    const rj = await readJson(rr);
+    if (!rr.ok) throw new Error(rj.error || rr.statusText);
+    const meta = rj.meta;
+    wireExportLinks(currentJobId, meta);
+    if (pondEditorEl) pondEditorEl.hidden = true;
+    setStatus(buildStatusText(meta, currentJobId));
+  } catch (e) {
+    console.error(e);
+    hideProgress();
+    setStatus(String(e.message || e));
+  } finally {
+    buildAmsBtn.disabled = false;
+  }
+});
 
 document.getElementById("run").addEventListener("click", async () => {
   const fileInput = document.getElementById("kml");
@@ -370,198 +797,10 @@ document.getElementById("run").addEventListener("click", async () => {
     const rj = await readJson(rr);
     if (!rr.ok) throw new Error(rj.error || rr.statusText);
     const meta = rj.meta;
-    const jobBuilt = (key) => exportBuilt(meta, key);
     await loadMapPreview(rj.textures.rgba);
-    if (jobBuilt("preview_glb")) {
-      setExportLink(
-        lnkGlb,
-        `/api/result/${jobId}/export.glb`,
-        exportDownloadName(meta, ".glb")
-      );
-      lnkGlb?.removeAttribute("aria-disabled");
-    } else {
-      setExportLink(lnkGlb, "#", null);
-      lnkGlb?.setAttribute("aria-disabled", "true");
-    }
-    if (jobBuilt("preview_obj")) {
-      setExportLink(
-        lnkZip,
-        `/api/result/${jobId}/export.zip`,
-        exportDownloadName(meta, "_obj.zip")
-      );
-      lnkZip?.removeAttribute("aria-disabled");
-    } else {
-      setExportLink(lnkZip, "#", null);
-      lnkZip?.setAttribute("aria-disabled", "true");
-    }
-    if (meta.print && meta.print.ok) {
-      if (jobBuilt("print_stl")) {
-        setExportLink(
-          lnkStl,
-          `/api/result/${jobId}/export.stl`,
-          exportDownloadName(meta, "_print.stl")
-        );
-        lnkStl?.removeAttribute("aria-disabled");
-      } else {
-        setExportLink(lnkStl, "#", null);
-        lnkStl?.setAttribute("aria-disabled", "true");
-      }
-      if (jobBuilt("print_textured_glb")) {
-        setExportLink(
-          lnkPrintTexturedGlb,
-          `/api/result/${jobId}/export_print_textured.glb`,
-          exportDownloadName(meta, "_print_textured.glb")
-        );
-        lnkPrintTexturedGlb?.removeAttribute("aria-disabled");
-      } else {
-        setExportLink(lnkPrintTexturedGlb, "#", null);
-        lnkPrintTexturedGlb?.setAttribute("aria-disabled", "true");
-      }
-      if (jobBuilt("print_3mf")) {
-        setExportLink(
-          lnk3mf,
-          `/api/result/${jobId}/export.3mf`,
-          exportDownloadName(meta, "_print.3mf")
-        );
-        lnk3mf?.removeAttribute("aria-disabled");
-      } else {
-        setExportLink(lnk3mf, "#", null);
-        lnk3mf?.setAttribute("aria-disabled", "true");
-      }
-      const ams = meta.print && meta.print.ams;
-      if (jobBuilt("print_ams") && ams && ams.ok) {
-        const amsSuffix = ams.download_suffix || "_print_ams_obj.zip";
-        setExportLink(
-          lnkAmsColor,
-          `/api/result/${jobId}/export_print_ams`,
-          exportDownloadName(meta, amsSuffix)
-        );
-        lnkAmsColor?.removeAttribute("aria-disabled");
-        renderAmsColors(ams);
-      } else {
-        setExportLink(lnkAmsColor, "#", null);
-        lnkAmsColor?.setAttribute("aria-disabled", "true");
-        if (ams && ams.ok) renderAmsColors(ams);
-        else renderAmsColors(null);
-      }
-      if (jobBuilt("print_ams_glb") && ams && ams.print_ams_glb) {
-        setExportLink(
-          lnkPrintAmsGlb,
-          `/api/result/${jobId}/export_print_ams.glb`,
-          exportDownloadName(meta, "_print_ams.glb")
-        );
-        lnkPrintAmsGlb?.removeAttribute("aria-disabled");
-      } else {
-        setExportLink(lnkPrintAmsGlb, "#", null);
-        lnkPrintAmsGlb?.setAttribute("aria-disabled", "true");
-      }
-    } else {
-      setExportLink(lnkStl, "#", null);
-      lnkStl?.setAttribute("aria-disabled", "true");
-      setExportLink(lnkPrintTexturedGlb, "#", null);
-      lnkPrintTexturedGlb?.setAttribute("aria-disabled", "true");
-      setExportLink(lnkPrintAmsGlb, "#", null);
-      lnkPrintAmsGlb?.setAttribute("aria-disabled", "true");
-      setExportLink(lnk3mf, "#", null);
-      lnk3mf?.setAttribute("aria-disabled", "true");
-      setExportLink(lnkAmsColor, "#", null);
-      lnkAmsColor?.setAttribute("aria-disabled", "true");
-      renderAmsColors(null);
-    }
-    const pz = meta.print && meta.print.pieces;
-    if (jobBuilt("print_pieces") && pz && pz.ok && pz.count > 0) {
-      setExportLink(
-        lnkPiecesZip,
-        `/api/result/${jobId}/export_print_pieces.zip`,
-        exportDownloadName(meta, "_print_pieces.zip")
-      );
-      lnkPiecesZip?.removeAttribute("aria-disabled");
-    } else {
-      setExportLink(lnkPiecesZip, "#", null);
-      lnkPiecesZip?.setAttribute("aria-disabled", "true");
-    }
-    exportsEl.hidden = false;
-    const splitDesc =
-      meta.print && (meta.print.split_nx > 1 || meta.print.split_nz > 1)
-        ? `Puzzle: ${meta.print.split_nx}×${meta.print.split_nz} (each tile scaled to ~print max mm on ground; monolithic STL is full assembly)\n`
-        : "";
-    const piecesLine =
-      pz && pz.count > 0
-        ? `Puzzle STLs: ${pz.count} file(s), ~${
-            pz.per_piece_size_mm
-              ? (
-                  pz.per_piece_size_mm.max_horizontal_mm_approx != null
-                    ? Number(pz.per_piece_size_mm.max_horizontal_mm_approx)
-                    : Math.max(pz.per_piece_size_mm.x, pz.per_piece_size_mm.y ?? 0)
-                ).toFixed(1)
-              : "?"
-          } mm max on ground per tile\n`
-        : meta.print && (meta.print.split_nx > 1 || meta.print.split_nz > 1)
-          ? `Puzzle STLs: none (split failed or empty)\n`
-          : "";
-    const printLine =
-      meta.print && meta.print.ok
-        ? `Print STL: ${meta.print.print_max_size_mm ?? meta.print.max_size_mm} mm max, base ${meta.print.base_extrusion_mm} mm, voxel ${
-            meta.print.voxel_size_mm_request != null
-              ? meta.print.voxel_size_mm_request
-              : meta.print.print_voxel_size_mm != null
-                ? `auto (~${Number(meta.print.print_voxel_size_mm).toFixed(2)} mm)`
-                : "auto"
-          }${
-            meta.print.print_vertical_span_mm != null
-              ? `, model height ~${Number(meta.print.print_vertical_span_mm).toFixed(2)} mm (slicer Z)`
-              : ""
-          }\n`
-        : meta.print && (meta.print.error || !meta.print.ok)
-          ? `Print STL: unavailable\n`
-          : "";
-    const multiBodyWarn =
-      meta.print && meta.print.ok && meta.print.print_component_count > 1
-        ? `Warning: print mesh has ${meta.print.print_component_count} separate bodies (expected one)\n`
-        : "";
-    const fullRel = meta.full_raster_relief_m;
-    const clipRel = meta.clipped_surface_relief_m;
-    const reliefHint =
-      fullRel != null &&
-      clipRel != null &&
-      fullRel > 1 &&
-      clipRel < 0.05 * fullRel
-        ? `Note: KML footprint is much flatter than the full download tile; preview matches print.\n`
-        : "";
-    const vex = meta.vertical_exaggeration != null ? Number(meta.vertical_exaggeration) : 1;
-    const meshZSpan =
-      meta.mesh_vertex_z_span_m != null
-        ? meta.mesh_vertex_z_span_m
-        : meta.mesh_vertex_y_span_m != null
-          ? meta.mesh_vertex_y_span_m
-          : null;
-    const meshZLine =
-      meshZSpan != null
-        ? `Terrain mesh: DEM → vertex Z span ${Number(meshZSpan).toFixed(2)} m (×${vex} vex); same Z in print STL (mm after scaling).\n`
-        : "";
-    const maskR = meta.masked_raster_relief_m;
-    const meshZForWarn = meshZSpan;
-    const reliefMismatch =
-      maskR != null &&
-      meshZForWarn != null &&
-      maskR > 0.5 &&
-      meshZForWarn < 0.05 * maskR
-        ? `Warning: footprint DEM varies ~${Number(maskR).toFixed(2)} m but triangulated mesh only ~${Number(meshZForWarn).toFixed(2)} m—possible polygon vs grid mismatch.\n`
-        : "";
-    setStatus(
-      `EPSG:${meta.epsg} · ${meta.grid_width}×${meta.grid_height}\n` +
-        (meta.elevation_min_m != null
-          ? `Elev ${meta.elevation_min_m.toFixed(1)}–${meta.elevation_max_m.toFixed(1)} m (raw DEM)\n`
-          : "") +
-        meshZLine +
-        reliefMismatch +
-        reliefHint +
-        splitDesc +
-        piecesLine +
-        printLine +
-        multiBodyWarn +
-        `Job ${jobId}`,
-    );
+    wireExportLinks(jobId, meta);
+    setupPondEditor(jobId, meta);
+    setStatus(buildStatusText(meta, jobId));
   } catch (e) {
     console.error(e);
     hideProgress();

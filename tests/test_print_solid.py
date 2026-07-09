@@ -82,6 +82,38 @@ class TestPrintSolid(unittest.TestCase):
         mesh_hard = mesh_mod.build_mesh(dem, tex, tr, mask=mask_hard, poly_utm=poly)
         self.assertGreater(len(mesh_hard.faces), 0)
 
+    def test_print_solid_matches_smoothed_mesh_clip_polygon(self) -> None:
+        """Print solid must use the same clip polygon as build_mesh when smoothing is on."""
+        h, w = 24, 24
+        dem = np.linspace(0, 1, h * w, dtype=np.float32).reshape(h, w)
+        tex = np.zeros((h, w, 3), dtype=np.uint8)
+        tr = rasterio.transform.from_bounds(0, 0, 120, 120, w, h)
+        poly = box(20, 20, 100, 100)
+        bounds = (0.0, 0.0, 120.0, 120.0)
+        mask, clip_poly, _sm = mesh_mod.resolve_boundary_clipping(
+            poly, (h, w), tr, bounds, w, h, 8.0
+        )
+        self.assertNotEqual(clip_poly.area, poly.area)
+        mesh = mesh_mod.build_mesh(dem, tex, tr, mask=mask, poly_utm=clip_poly)
+        solid, meta, _surf = mesh_mod.build_print_solid(
+            mesh,
+            clip_poly,
+            print_max_size_mm=100.0,
+            center_on_bed=True,
+            voxel_size_mm=None,
+        )
+        self.assertTrue(meta.get("z_up"))
+        self.assertEqual(int(meta.get("print_component_count", 0)), 1)
+        mb = mesh.bounds
+        sb = solid.bounds
+        self.assertIsNotNone(mb)
+        self.assertIsNotNone(sb)
+        # Scaled print solid horizontal span should track the clipped mesh, not the raw KML box.
+        mesh_span = max(mb[1, 0] - mb[0, 0], mb[1, 1] - mb[0, 1])
+        solid_span = max(sb[1, 0] - sb[0, 0], sb[1, 1] - sb[0, 1])
+        self.assertGreater(mesh_span, 0.0)
+        self.assertAlmostEqual(solid_span / mesh_span, meta["scale_meters_to_print_mm"], delta=0.05)
+
     def test_quad_inclusion_mask_matches_mesh(self) -> None:
         h, w = 20, 20
         x = np.linspace(0, 1, w)

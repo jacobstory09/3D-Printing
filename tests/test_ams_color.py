@@ -53,6 +53,17 @@ class TestAmsColor(unittest.TestCase):
         self.assertEqual(pond["name"], "Pond")
         self.assertGreater(int(pond.get("pond_pixel_count") or 0), 0)
 
+    def test_recommend_palette_pond_mask_override_uses_filament_rgb(self) -> None:
+        rgba = np.zeros((48, 48, 4), dtype=np.uint8)
+        rgba[:, :, :3] = (70, 110, 45)
+        rgba[:, :, 3] = 255
+        pond_mask = np.zeros((48, 48), dtype=bool)
+        pond_mask[18:26, 18:26] = True
+        palette = ams_color.recommend_ams_palette(rgba, n_colors=4, pond_mask=pond_mask)
+        pond = next(p for p in palette if p.get("role") == "pond")
+        self.assertEqual(pond["rgb"], list(ams_color.POND_FILAMENT_RGB))
+        self.assertGreater(int(pond.get("pond_pixel_count") or 0), 0)
+
     def test_uniform_pasture_not_detected_conservative(self) -> None:
         h, w = 64, 64
         rgba = np.zeros((h, w, 4), dtype=np.uint8)
